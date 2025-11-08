@@ -1,5 +1,5 @@
 (ns tailrecursion.chasma
-  "Transactional actor runtime for Clojure (JVM-only, no deps)."
+  "Transactional actor runtime for Clojure"
   (:import (java.util UUID)
            (java.util.concurrent Executors LinkedBlockingQueue ConcurrentHashMap TimeUnit CompletableFuture ExecutorService)
            (java.util.function Function)

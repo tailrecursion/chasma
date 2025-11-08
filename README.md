@@ -2,6 +2,8 @@
 
 A tiny transactional actor runtime in Clojure, inspired by [David McClain's Lisp Actors](https://github.com/dbmcclain/Lisp-Actors/tree/main#).
 
+**Note: This library is in active early development, highly experimental, and subject to change.**
+
 ## Problem
 
 Coordinating concurrent workflows typically requires explicit thread management, shared-state locks, or callback graphs. These approaches are brittle under contention and make it difficult to reason about when effects become visible. Chasma provides per-actor behaviors, transactional turns, and automatic retries so message handlers can stay pure and deterministic.
