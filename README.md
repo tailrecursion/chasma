@@ -22,7 +22,7 @@ Coordinating concurrent workflows typically requires explicit thread management,
 
 (defn demo []
   (ch/start!)
-  (let [c (ch/spawn (counter 0))]
+  (let [c (ch/lane (ch/spawn (counter 0)))]
     (ch/send! c :inc)
     (ch/send! c :inc)
     ;; print 2
@@ -62,17 +62,19 @@ Coordinating concurrent workflows typically requires explicit thread management,
 | `start!` | Starts the dispatcher; idempotent. |
 | `shutdown!` | Stops the dispatcher and shuts down the worker pool. |
 | `spawn behavior-fn` | Creates an actor whose behavior is a variadic fn. Returns an `Actor` record. |
-| `send! actor & msg` | Enqueues a message. Optional first arg `{:ser token}` forces per-token serialization. |
+| `lane actor` | Creates a private serialized target for an actor. |
+| `send! target & msg` | Enqueues a message to an actor or lane target. |
 | `become! actor new-beh ...` | Schedules one or more behavior changes. Inside a turn it buffers until commit; outside it applies atomically. |
-| `ask actor & msg` | Sends a request and returns a `java.util.concurrent.CompletableFuture` (supports `deref`). |
+| `ask target & msg` | Sends a request to an actor or lane target and returns a `java.util.concurrent.CompletableFuture` (supports `deref`). |
 | `on-commit! & body` | Defers the body so it runs once, after the current turn commits successfully (must be called inside a turn). |
 
 ## Execution Model
 
-- Each delivery runs inside an implicit transaction buffer. All `send!` calls and any number of `become!` updates made during a behavior execute only after the behavior returns successfully.
+- Each delivery runs inside an implicit transaction buffer. All outbound `send!` and `ask` deliveries and any number of `become!` updates made during a behavior execute only after the behavior returns successfully.
 - A thrown exception or compare-and-set failure during commit discards the buffered effects and re-enqueues the message with bounded exponential backoff.
-- `on-commit!` schedules irreversible effects (logging, IO, etc.) and can only be invoked inside a turn; failures before commit drop the effect entirely.
-- Optional serializer lanes (`:ser token`) attach a fair `ReentrantLock` per token so mail is processed sequentially when required.
+- `on-commit!` schedules irreversible effects (logging, IO, etc.) and can only be invoked inside a turn; failures before commit drop the effect entirely. Once state has committed, `on-commit!` failures are reported and do not retry the turn.
+- `lane` creates a serialized target/capability for an actor. Mail sent through one lane is processed FIFO, one full delivery turn at a time; separate lanes for the same actor remain independent.
+- Messages sent while an actor is executing through a lane preserve that lane as the reply capability, so callees can reply through the same serialized target.
 - Work is pulled from a single queue by a fixed thread pool; actors are identity envelopes around mutable behavior atoms.
 
 ## Dynamic Vars
@@ -82,7 +84,7 @@ Available inside every behavior:
 | Var | Meaning |
 | --- | ------- |
 | `*self*` | The actor envelope currently executing. |
-| `*sender*` | Actor that sent the current message (or `nil`). |
+| `*sender*` | Reply target/capability for the current message, such as an actor, lane, or `nil`. |
 | `*reply*` | Convenience fn `(fn [v])` that sends a reply back to `*sender*`. |
 | `*tx*` | Internal transaction buffer (implementation detail, provided for completeness). |
 

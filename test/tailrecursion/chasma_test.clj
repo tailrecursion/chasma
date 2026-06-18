@@ -64,19 +64,18 @@
       (.countDown latch))))
 
 (defn run-lane-probe
-  "Sends multiple messages to the given actor, optionally through a serializer lane."
-  [token]
+  "Sends multiple messages to the given target."
+  [serialized?]
   (let [n        16
         latch    (CountDownLatch. n)
         in-flight (atom 0)
         max-inf  (atom 0)
-        actor    (ch/spawn (lane-probe-behavior latch in-flight max-inf))]
+        actor    (ch/spawn (lane-probe-behavior latch in-flight max-inf))
+        target   (if serialized? (ch/lane actor) actor)]
     (dotimes [_ n]
-      (if token
-        (ch/send! actor {:ser token} :tick)
-        (ch/send! actor :tick)))
+      (ch/send! target :tick))
     (when-not (.await latch 2000 TimeUnit/MILLISECONDS)
-      (throw (ex-info "Timed out waiting for lane probe" {:token token})))
+      (throw (ex-info "Timed out waiting for lane probe" {:serialized? serialized?})))
     @max-inf))
 
 (defn lane-blocker
@@ -138,6 +137,29 @@
     (is (= :new-a (deref (ch/ask a) 1000 ::timeout)))
     (is (= :new-b (deref (ch/ask b) 1000 ::timeout)))))
 
+(deftest multi-become-compacts-repeated-actors
+  (let [a   (ch/spawn (responder :old))
+        ctl (ch/spawn
+              (fn [& _]
+                (ch/become! a (responder :middle))
+                (ch/become! a (responder :final))
+                (ch/*reply* :done)))]
+    (is (= :done (deref (ch/ask ctl) 1000 ::timeout)))
+    (is (= :final (deref (ch/ask a) 1000 ::timeout)))))
+
+(deftest multi-become-commit-is-all-or-nothing
+  (let [a      (ch/spawn (responder :old-a))
+        b      (ch/spawn (responder :old-b))
+        tx     (#'ch/new-tx)
+        old-a  @(.-beh a)
+        old-b  @(.-beh b)]
+    (swap! (:becomes tx) conj {:actor a :old old-a :new (responder :new-a)})
+    (swap! (:becomes tx) conj {:actor b :old old-b :new (responder :new-b)})
+    (reset! (.-beh b) (responder :conflict-b))
+    (is (thrown? clojure.lang.ExceptionInfo (#'ch/commit! tx)))
+    (is (identical? old-a @(.-beh a)))
+    (is (= :conflict-b (deref (ch/ask b) 1000 ::timeout)))))
+
 (use-fixtures :once
   (fn [f]
     (ch/start!)
@@ -147,17 +169,10 @@
         (ch/shutdown!)))))
 
 (deftest counter-behavior-test
-  (let [counter (ch/spawn (counter 0))]
+  (let [counter (ch/lane (ch/spawn (counter 0)))]
     (ch/send! counter :inc)
     (ch/send! counter :inc)
-    (let [value (loop [attempts 0]
-                  (let [v (deref (ch/ask counter :get) 1000 ::timeout)]
-                    (if (or (= v 2) (>= attempts 20))
-                      v
-                      (do
-                        (Thread/sleep 10)
-                        (recur (inc attempts))))))]
-      (is (= 2 value)))))
+    (is (= 2 (deref (ch/ask counter :get) 1000 ::timeout)))))
 
 (deftest ask-retries-after-failure
   (let [attempts (atom 0)
@@ -169,10 +184,20 @@
     (is (= 2 @attempts))))
 
 (deftest serializer-lane-enforces-exclusion
-  (let [no-lane-max (run-lane-probe nil)
-        lane-max    (run-lane-probe :lane/test)]
+  (let [no-lane-max (run-lane-probe false)
+        lane-max    (run-lane-probe true)]
     (is (> no-lane-max 1) "Without a lane, multiple deliveries should overlap")
     (is (= 1 lane-max) "Serializer lane forces sequential turns")))
+
+(deftest map-first-arg-is-payload
+  (let [observed (atom nil)
+        latch    (CountDownLatch. 1)
+        actor    (ch/spawn (fn [& payload]
+                              (reset! observed (vec payload))
+                              (.countDown latch)))]
+    (ch/send! actor {:ser :not-options} :value)
+    (is (.await latch 1000 TimeUnit/MILLISECONDS))
+    (is (= [{:ser :not-options} :value] @observed))))
 
 (deftest send-effects-commit-only-after-success
   (let [hits     (atom [])
@@ -209,15 +234,107 @@
   (let [start   (CountDownLatch. 2)
         release (CountDownLatch. 1)
         done    (CountDownLatch. 2)
-        actor   (ch/spawn (lane-blocker start release done))]
-    (ch/send! actor {:ser :lane/a} :ping)
-    (ch/send! actor {:ser :lane/b} :pong)
+        actor   (ch/spawn (lane-blocker start release done))
+        lane-a  (ch/lane actor)
+        lane-b  (ch/lane actor)]
+    (ch/send! lane-a :ping)
+    (ch/send! lane-b :pong)
     (try
       (is (.await start 500 TimeUnit/MILLISECONDS)
-          "Distinct serializer tokens should run concurrently")
+          "Distinct lanes should run concurrently")
       (finally
         (.countDown release)))
     (is (.await done 1000 TimeUnit/MILLISECONDS))))
+
+(deftest sender-preserves-lane-capability
+  (let [observed (atom nil)
+        latch    (CountDownLatch. 1)
+        a        (ch/spawn (fn [_ target]
+                             (ch/send! target :from-a)
+                             (ch/become! ch/*self*
+                               (fn [v]
+                                 (reset! observed v)
+                                 (.countDown latch)))))
+        a-lane   (ch/lane a)
+        b        (ch/spawn (fn [& _]
+                             (ch/send! ch/*sender*
+                                       (instance? tailrecursion.chasma.Lane ch/*sender*))))]
+    (ch/send! a-lane :go b)
+    (is (.await latch 1000 TimeUnit/MILLISECONDS))
+    (is (= true @observed))))
+
+(deftest ask-effects-commit-only-after-success
+  (let [hits      (atom [])
+        latch     (CountDownLatch. 1)
+        target    (ch/spawn (fn [& payload]
+                              (swap! hits conj (vec payload))
+                              (.countDown latch)
+                              (ch/*reply* :ok)))
+        attempts  (atom 0)
+        fail-once (atom true)
+        actor     (ch/spawn (fn [& _]
+                              (let [n (swap! attempts inc)]
+                                (ch/ask target :attempt n)
+                                (when (compare-and-set! fail-once true false)
+                                  (throw (ex-info "boom" {:attempt n}))))))]
+    (ch/send! actor :run)
+    (is (.await latch 1000 TimeUnit/MILLISECONDS))
+    (is (= [[:attempt 2]] @hits))
+    (is (= 2 @attempts))))
+
+(deftest on-commit-preserves-dynamic-context
+  (let [observed (atom nil)
+        latch    (CountDownLatch. 1)
+        actor-ref (atom nil)
+        actor    (ch/spawn
+                   (fn [& _]
+                     (ch/on-commit!
+                       (reset! observed {:self?  (identical? ch/*self* @actor-ref)
+                                         :sender ch/*sender*
+                                         :tx     ch/*tx*})
+                       (.countDown latch))
+                     (ch/*reply* :done)))]
+    (reset! actor-ref actor)
+    (is (= :done (deref (ch/ask actor) 1000 ::timeout)))
+    (is (.await latch 1000 TimeUnit/MILLISECONDS))
+    (is (:self? @observed))
+    (is (some? (:sender @observed)))
+    (is (nil? (:tx @observed)))))
+
+(deftest on-commit-failure-does-not-retry-turn
+  (let [attempts (atom 0)
+        hits     (atom [])
+        latch    (CountDownLatch. 1)
+        target   (ch/spawn (fn [& payload]
+                             (swap! hits conj (vec payload))
+                             (.countDown latch)))
+        actor    (ch/spawn (fn [& _]
+                             (swap! attempts inc)
+                             (ch/send! target :committed)
+                             (ch/on-commit!
+                               (throw (ex-info "effect failed" {})))))]
+    (ch/send! actor :run)
+    (is (.await latch 1000 TimeUnit/MILLISECONDS))
+    (Thread/sleep 100)
+    (is (= 1 @attempts))
+    (is (= [[:committed]] @hits))))
+
+(deftest runtime-can-restart
+  (ch/shutdown!)
+  (try
+    (is (= :started (ch/start!)))
+    (let [counter (ch/lane (ch/spawn (counter 0)))]
+      (ch/send! counter :inc)
+      (is (= 1 (deref (ch/ask counter :get) 1000 ::timeout))))
+    (is (= :stopped (ch/shutdown!)))
+    (is (= :started (ch/start!)))
+    (let [counter (ch/lane (ch/spawn (counter 0)))]
+      (ch/send! counter :inc)
+      (ch/send! counter :inc)
+      (is (= 2 (deref (ch/ask counter :get) 1000 ::timeout))))
+    (finally
+      (ch/start!))))
+
 (deftest odd-even-mutual-recursion
   (let [even (ch/spawn)
         odd  (ch/spawn)
