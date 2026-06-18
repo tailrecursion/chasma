@@ -109,6 +109,94 @@
                 seen (into seen nexts)]
             (recur queue seen)))))))
 
+(defn- subset? [a b] (every? #(contains? b %) a))
+
+(defn- same-value? [a b] (= a b))
+
+(defn- finite-in-set [spec]
+  (let [s (:set spec)]
+    (cond (set? s) s
+          (map? s) (set (keys s))
+          (sequential? s) (set s)
+          (coll? s) (set s)
+          :else nil)))
+
+(defn- map-entry-implies-key=?
+  [m key value]
+  (and (contains? m key) (same-value? (get m key) value)))
+
+(defn- implies-map-keys?
+  [m ks]
+  (subset? (set ks) (set (keys m))))
+
+(defn- struct-implies-class?
+  [struct-spec class-spec]
+  (.isAssignableFrom ^Class (specializer-class class-spec)
+                     PersistentStructMap))
+
+(defn- implies-specializer? [a b]
+  (let [ak (specializer-kind a)
+        bk (specializer-kind b)]
+    (or (= bk :any)
+        (= a b)
+        (case ak
+          :value
+            (let [v (:value a)]
+              (case bk
+                :in (in-contains? (:set b) v)
+                :class (instance? (specializer-class b) v)
+                :isa (isa? v (:value b))
+                false))
+          :in
+            (case bk
+              :in (let [as (finite-in-set a)
+                        bs (finite-in-set b)]
+                    (and as bs (subset? as bs)))
+              false)
+          :struct
+            (case bk
+              :struct (identical? (:struct a) (:struct b))
+              :class (struct-implies-class? a b)
+              false)
+          :map=
+            (let [m (:map a)]
+              (case bk
+                :map= (every? (fn [[k v]] (map-entry-implies-key=?
+                                             m k v))
+                        (:map b))
+                :key= (map-entry-implies-key=? m (:key b) (:value b))
+                :keys (implies-map-keys? m (:keys b))
+                false))
+          :key=
+            (case bk
+              :key= (and (= (:key a) (:key b))
+                         (same-value? (:value a) (:value b)))
+              :keys (contains? (set (:keys b)) (:key a))
+              false)
+          :keys
+            (case bk
+              :keys (subset? (set (:keys b)) (set (:keys a)))
+              false)
+          :keys=
+            (case bk
+              :keys= (= (:keys a) (:keys b))
+              :keys (subset? (set (:keys b)) (:keys a))
+              false)
+          :class
+            (case bk
+              :class (.isAssignableFrom ^Class (specializer-class b)
+                                        ^Class (specializer-class a))
+              false)
+          :isa
+            (case bk
+              :isa (isa? (:value a) (:value b))
+              false)
+          false))))
+
+(defn- dominates-specializer? [a b]
+  (and (implies-specializer? a b)
+       (not (implies-specializer? b a))))
+
 (defn- specificity-score
   [spec arg]
   (case (specializer-kind spec)
@@ -127,15 +215,27 @@
     :any [11 0]
     [12 0]))
 
-(defn- method-score
-  [method args]
-  (mapv specificity-score (:specializers method) args))
+(defn- compare-specializers [s1 s2 arg]
+  (cond (dominates-specializer? s1 s2) -1
+        (dominates-specializer? s2 s1) 1
+        :else (compare (specificity-score s1 arg)
+                       (specificity-score s2 arg))))
+
+(defn- compare-methods [m1 m2 args]
+  (loop [specs1 (:specializers m1)
+         specs2 (:specializers m2)
+         args args]
+    (if (or (empty? specs1) (empty? specs2))
+      0
+      (let [cmp (compare-specializers (first specs1) (first specs2)
+                                      (first args))]
+        (if (zero? cmp)
+          (recur (rest specs1) (rest specs2) (rest args))
+          cmp)))))
 
 (defn- more-specific?
   [m1 m2 args]
-  (let [s1 (method-score m1 args)
-        s2 (method-score m2 args)
-        cmp (compare s1 s2)]
+  (let [cmp (compare-methods m1 m2 args)]
     (if (zero? cmp) (< (:index m1) (:index m2)) (neg? cmp))))
 
 (defn- sort-methods [methods args] (sort #(more-specific? %1 %2 args) methods))
