@@ -98,8 +98,6 @@
 
 (defn- new-tx [^Universe u] (->Txn u (atom []) (atom []) (atom [])))
 
-(declare commit!)
-
 (defn- delivery-universe [^Delivery d] (:universe (:to d)))
 
 (defn- target-delivery [target]
@@ -149,6 +147,51 @@
   (doseq [[^Actor actor beh] pairs]
     (let [observed @(.-beh actor)]
       (swap! (:becomes tx) conj {:actor actor :old observed :new beh}))))
+
+(defn- compact-becomes [becomes]
+  (vals
+    (reduce (fn [m {:keys [actor old new]}]
+              (if-let [entry (get m actor)]
+                (assoc m actor (assoc entry :new new))
+                (assoc m actor {:actor actor :old old :new new})))
+            {}
+            becomes)))
+
+(defn- lock-actors! [actors f]
+  (letfn [(step [actors]
+            (if-let [actor (first actors)]
+              (locking actor
+                (step (next actors)))
+              (f)))]
+    (step (sort-by :id actors))))
+
+(defn- run-commit-effects! [^Universe u effects]
+  (doseq [f effects]
+    (try
+      (binding [*tx* nil]
+        (f))
+      (catch Throwable t
+        ((:effect-error-handler (:opts u)) t)))))
+
+(defn- validate-staged-sends! [sends]
+  (doseq [^Delivery d sends]
+    (ensure-running! (delivery-universe d))))
+
+(defn- commit! [^Txn tx]
+  (let [sends   @(:sends tx)
+        becomes (vec (compact-becomes @(:becomes tx)))
+        actors  (mapv :actor becomes)]
+    (validate-staged-sends! sends)
+    (lock-actors! actors
+      (fn []
+        (doseq [{:keys [^Actor actor old]} becomes]
+          (when-not (identical? old @(.-beh actor))
+            (throw (ex-info "Commit conflict" {:actor actor}))))
+        (doseq [{:keys [^Actor actor new]} becomes]
+          (reset! (.-beh actor) new))))
+    (doseq [^Delivery d sends]
+      (put-delivery! d))
+    (run-commit-effects! (:universe tx) @(:effects tx))))
 
 (defn- apply-become-pairs! [u pairs]
   (when (and *tx* (not (identical? u (:universe *tx*))))
@@ -201,51 +244,6 @@
        nil)
      (throw (IllegalStateException. "on-commit requires an active turn"))))
 
-(defn- compact-becomes [becomes]
-  (vals
-    (reduce (fn [m {:keys [actor old new]}]
-              (if-let [entry (get m actor)]
-                (assoc m actor (assoc entry :new new))
-                (assoc m actor {:actor actor :old old :new new})))
-            {}
-            becomes)))
-
-(defn- lock-actors! [actors f]
-  (letfn [(step [actors]
-            (if-let [actor (first actors)]
-              (locking actor
-                (step (next actors)))
-              (f)))]
-    (step (sort-by :id actors))))
-
-(defn- run-commit-effects! [^Universe u effects]
-  (doseq [f effects]
-    (try
-      (binding [*tx* nil]
-        (f))
-      (catch Throwable t
-        ((:effect-error-handler (:opts u)) t)))))
-
-(defn- validate-staged-sends! [sends]
-  (doseq [^Delivery d sends]
-    (ensure-running! (delivery-universe d))))
-
-(defn- commit! [^Txn tx]
-  (let [sends   @(:sends tx)
-        becomes (vec (compact-becomes @(:becomes tx)))
-        actors  (mapv :actor becomes)]
-    (validate-staged-sends! sends)
-    (lock-actors! actors
-      (fn []
-        (doseq [{:keys [^Actor actor old]} becomes]
-          (when-not (identical? old @(.-beh actor))
-            (throw (ex-info "Commit conflict" {:actor actor}))))
-        (doseq [{:keys [^Actor actor new]} becomes]
-          (reset! (.-beh actor) new))))
-    (doseq [^Delivery d sends]
-      (put-delivery! d))
-    (run-commit-effects! (:universe tx) @(:effects tx))))
-
 (defn- backoff-ms [^Universe u n]
   (let [{:keys [retry-base-ms retry-max-ms]} (:opts u)]
     (min retry-max-ms
@@ -286,20 +284,6 @@
       (when-let [retry (run-attempt d)]
         (recur retry)))))
 
-(declare drain-serializer!)
-
-(defn- schedule-serializer! [^Universe u ^Serializer s]
-  (when-let [^ExecutorService executor @(:pool u)]
-    (.submit executor ^Runnable #(drain-serializer! u s))))
-
-(defn- enqueue-serialized! [^Universe u ^Serializer s ^Delivery d]
-  (ensure-running! u)
-  (let [start? (locking s
-                 (.addLast ^ArrayDeque (:queue s) d)
-                 (compare-and-set! (:running? s) false true))]
-    (when start?
-      (schedule-serializer! u s))))
-
 (defn- next-serialized-delivery [^Serializer s]
   (locking s
     (if-let [d (.pollFirst ^ArrayDeque (:queue s))]
@@ -314,6 +298,18 @@
       (when-let [d (next-serialized-delivery s)]
         (run-with-retries! d)
         (recur)))))
+
+(defn- schedule-serializer! [^Universe u ^Serializer s]
+  (when-let [^ExecutorService executor @(:pool u)]
+    (.submit executor ^Runnable #(drain-serializer! u s))))
+
+(defn- enqueue-serialized! [^Universe u ^Serializer s ^Delivery d]
+  (ensure-running! u)
+  (let [start? (locking s
+                 (.addLast ^ArrayDeque (:queue s) d)
+                 (compare-and-set! (:running? s) false true))]
+    (when start?
+      (schedule-serializer! u s))))
 
 (defn- run-delivery! [^Delivery d]
   (when-let [retry (run-attempt d)]
