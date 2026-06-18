@@ -24,18 +24,11 @@
                      :chasma/generic))
     (throw (ex-info "Not a generic function" {:name name}))))
 
-(defn- resolve-class
-  [sym]
-  (let [v (resolve sym)
-        c (cond (instance? Class v) v
-                (and (var? v) (instance? Class @v)) @v)]
-    c))
-
-(defn- resolve-struct-def
-  [sym]
+(defn- resolve-instance
+  [sym class]
   (let [v (resolve sym)]
-    (cond (instance? PersistentStructMap$Def v) v
-          (and (var? v) (instance? PersistentStructMap$Def @v)) @v)))
+    (cond (instance? class v) v
+          (and (var? v) (instance? class @v)) @v)))
 
 (def ^:private struct-def-field
   (doto (.getDeclaredField PersistentStructMap "def")
@@ -116,14 +109,6 @@
   [m key value]
   (and (contains? m key) (= (get m key) value)))
 
-(defn- implies-map-keys?
-  [m ks]
-  (subset? (set ks) (set (keys m))))
-
-(defn- struct-implies-class?
-  [struct-spec class-spec]
-  (.isAssignableFrom ^Class (:class class-spec) PersistentStructMap))
-
 (defn- implies-specializer? [a b]
   (let [ak (:kind a)
         bk (:kind b)]
@@ -146,7 +131,7 @@
           :struct
             (case bk
               :struct (identical? (:struct a) (:struct b))
-              :class (struct-implies-class? a b)
+              :class (.isAssignableFrom ^Class (:class b) PersistentStructMap)
               false)
           :map=
             (let [m (:map a)]
@@ -155,7 +140,7 @@
                                              m k v))
                         (:map b))
                 :key= (map-entry-implies-key=? m (:key b) (:value b))
-                :keys (implies-map-keys? m (:keys b))
+                :keys (subset? (set (:keys b)) (set (keys m)))
                 false))
           :key=
             (case bk
@@ -258,6 +243,12 @@
   (let [applies? (fn [spec arg] (applicable? spec arg pred-exceptions))]
     (filter #(every? true? (map applies? (:specializers %) args)) methods)))
 
+(defn- primary-methods [methods args pred-exceptions]
+  (sort-methods
+    (filter #(= :primary (:qualifier %))
+            (applicable-methods methods args pred-exceptions))
+    args))
+
 (defn- combine-standard
   [methods args pred-exceptions]
   (let [applicable (applicable-methods methods args pred-exceptions)
@@ -281,11 +272,7 @@
 
 (defn- combine-simple
   [methods args pred-exceptions op]
-  (let [primaries
-          (sort-methods
-            (filter #(= :primary (:qualifier %))
-                    (applicable-methods methods args pred-exceptions))
-            args)
+  (let [primaries (primary-methods methods args pred-exceptions)
         values (map #(apply (:fn %) args) primaries)]
     (case op
       :list (vec values)
@@ -298,11 +285,7 @@
 
 (defn- combine-default
   [methods args pred-exceptions]
-  (let [primaries
-          (sort-methods
-            (filter #(= :primary (:qualifier %))
-                    (applicable-methods methods args pred-exceptions))
-            args)]
+  (let [primaries (primary-methods methods args pred-exceptions)]
     (when-let [method (first primaries)] (apply (:fn method) args))))
 
 (defn- invoke-generic
@@ -431,9 +414,9 @@
                       (cond (symbol? p) `{:kind :satisfies,
                                           :protocol (deref (var ~p))}
                             :else `{:kind :satisfies, :protocol ~p}))
-                  (symbol? spec) (if (resolve-struct-def spec)
+                  (symbol? spec) (if (resolve-instance spec PersistentStructMap$Def)
                                    `{:kind :struct, :struct (deref (var ~spec))}
-                                   (if-let [c (resolve-class spec)]
+                                   (if-let [c (resolve-instance spec Class)]
                                      {:kind :class, :class c}
                                      (throw (ex-info "Unknown class specializer"
                                                      {:specializer spec}))))

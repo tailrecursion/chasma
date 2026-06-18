@@ -159,12 +159,11 @@
     (loop []
       (let [tx (new-tx u)]
         (enqueue-becomes! tx pairs)
-        (if (try
-              (commit! tx)
-              true
-              (catch Throwable _
-                false))
-          nil
+        (when (try
+                (commit! tx)
+                false
+                (catch Throwable _
+                  true))
           (recur))))))
 
 (defn become!
@@ -265,25 +264,26 @@
         u   (:universe act)
         beh @(.-beh act)
         tx  (new-tx u)
-        reply-fn (fn [v] (when *sender* (send! *sender* v)))
-        runnable (fn []
-                   (binding [*universe* u
-                             *self*     act
-                             *self-target* (:target d)
-                             *sender*   (:from d)
-                             *reply*    reply-fn
-                             *tx*       tx]
-                     (apply beh (:payload d))))]
-    (runnable)
+        reply-fn (fn [v] (when *sender* (send! *sender* v)))]
+    (binding [*universe* u
+              *self*     act
+              *self-target* (:target d)
+              *sender*   (:from d)
+              *reply*    reply-fn
+              *tx*       tx]
+      (apply beh (:payload d)))
     (commit! tx)))
+
+(defn- run-attempt [^Delivery d]
+  (try
+    (run-turn! d)
+    (catch Throwable _
+      (retry-delivery d))))
 
 (defn- run-with-retries! [^Delivery d]
   (loop [d d]
     (when @(:running? (delivery-universe d))
-      (when-let [retry (try
-                         (run-turn! d)
-                         (catch Throwable _
-                           (retry-delivery d)))]
+      (when-let [retry (run-attempt d)]
         (recur retry)))))
 
 (declare drain-serializer!)
@@ -316,10 +316,7 @@
         (recur)))))
 
 (defn- run-delivery! [^Delivery d]
-  (when-let [retry (try
-                     (run-turn! d)
-                     (catch Throwable _
-                       (retry-delivery d)))]
+  (when-let [retry (run-attempt d)]
     (enqueue! retry)))
 
 (defn- pump-loop [^Universe u]
