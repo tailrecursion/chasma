@@ -28,20 +28,14 @@
   [sym]
   (let [v (resolve sym)
         c (cond (instance? Class v) v
-                (and (var? v) (instance? Class @v)) @v
-                :else nil)]
+                (and (var? v) (instance? Class @v)) @v)]
     c))
 
 (defn- resolve-struct-def
   [sym]
   (let [v (resolve sym)]
     (cond (instance? PersistentStructMap$Def v) v
-          (and (var? v) (instance? PersistentStructMap$Def @v)) @v
-          :else nil)))
-
-(defn- specializer-class [spec] (:class spec))
-
-(defn- specializer-kind [spec] (:kind spec))
+          (and (var? v) (instance? PersistentStructMap$Def @v)) @v)))
 
 (def ^:private struct-def-field
   (doto (.getDeclaredField PersistentStructMap "def")
@@ -71,7 +65,7 @@
 
 (defn- applicable?
   [spec arg pred-exceptions]
-  (case (specializer-kind spec)
+  (case (:kind spec)
     :any true
     :value (= (:value spec) arg)
     :in (in-contains? (:set spec) arg)
@@ -85,7 +79,7 @@
                            (and (safe-apply (:kpred spec) k pred-exceptions)
                                 (safe-apply (:vpred spec) v pred-exceptions)))
                          arg))
-    :class (instance? (specializer-class spec) arg)
+    :class (instance? (:class spec) arg)
     :pred (safe-apply (:pred spec) arg pred-exceptions)
     :satisfies
       (safe-apply (partial satisfies? (:protocol spec)) arg pred-exceptions)
@@ -111,19 +105,16 @@
 
 (defn- subset? [a b] (every? #(contains? b %) a))
 
-(defn- same-value? [a b] (= a b))
-
 (defn- finite-in-set [spec]
   (let [s (:set spec)]
     (cond (set? s) s
           (map? s) (set (keys s))
           (sequential? s) (set s)
-          (coll? s) (set s)
-          :else nil)))
+          (coll? s) (set s))))
 
 (defn- map-entry-implies-key=?
   [m key value]
-  (and (contains? m key) (same-value? (get m key) value)))
+  (and (contains? m key) (= (get m key) value)))
 
 (defn- implies-map-keys?
   [m ks]
@@ -131,12 +122,11 @@
 
 (defn- struct-implies-class?
   [struct-spec class-spec]
-  (.isAssignableFrom ^Class (specializer-class class-spec)
-                     PersistentStructMap))
+  (.isAssignableFrom ^Class (:class class-spec) PersistentStructMap))
 
 (defn- implies-specializer? [a b]
-  (let [ak (specializer-kind a)
-        bk (specializer-kind b)]
+  (let [ak (:kind a)
+        bk (:kind b)]
     (or (= bk :any)
         (= a b)
         (case ak
@@ -144,7 +134,7 @@
             (let [v (:value a)]
               (case bk
                 :in (in-contains? (:set b) v)
-                :class (instance? (specializer-class b) v)
+                :class (instance? (:class b) v)
                 :isa (isa? v (:value b))
                 false))
           :in
@@ -170,7 +160,7 @@
           :key=
             (case bk
               :key= (and (= (:key a) (:key b))
-                         (same-value? (:value a) (:value b)))
+                         (= (:value a) (:value b)))
               :keys (contains? (set (:keys b)) (:key a))
               false)
           :keys
@@ -184,8 +174,7 @@
               false)
           :class
             (case bk
-              :class (.isAssignableFrom ^Class (specializer-class b)
-                                        ^Class (specializer-class a))
+              :class (.isAssignableFrom ^Class (:class b) ^Class (:class a))
               false)
           :isa
             (case bk
@@ -199,7 +188,7 @@
 
 (defn- specificity-score
   [spec arg]
-  (case (specializer-kind spec)
+  (case (:kind spec)
     :value [0 0]
     :in [1 0]
     :struct [2 0]
@@ -211,7 +200,7 @@
     :isa [8 0]
     :pred [9 0]
     :satisfies [9 0]
-    :class [10 (class-distance (class arg) (specializer-class spec))]
+    :class [10 (class-distance (class arg) (:class spec))]
     :any [11 0]
     [12 0]))
 
@@ -262,14 +251,16 @@
   [arity args]
   (let [actual (count args)]
     (when (and arity (not= arity actual))
-      (throw (ex-info "Arity mismatch" {:expected arity, :actual actual})))
-    true))
+      (throw (ex-info "Arity mismatch" {:expected arity, :actual actual})))))
+
+(defn- applicable-methods
+  [methods args pred-exceptions]
+  (let [applies? (fn [spec arg] (applicable? spec arg pred-exceptions))]
+    (filter #(every? true? (map applies? (:specializers %) args)) methods)))
 
 (defn- combine-standard
   [methods args pred-exceptions]
-  (let [applies? (fn [spec arg] (applicable? spec arg pred-exceptions))
-        applicable (filter #(every? true? (map applies? (:specializers %) args))
-                     methods)
+  (let [applicable (applicable-methods methods args pred-exceptions)
         grouped (group-by :qualifier applicable)
         arounds (sort-methods (get grouped :around []) args)
         befores (sort-methods (get grouped :before []) args)
@@ -290,12 +281,10 @@
 
 (defn- combine-simple
   [methods args pred-exceptions op]
-  (let [applies? (fn [spec arg] (applicable? spec arg pred-exceptions))
-        primaries
+  (let [primaries
           (sort-methods
-            (filter #(and (= :primary (:qualifier %))
-                          (every? true? (map applies? (:specializers %) args)))
-              methods)
+            (filter #(= :primary (:qualifier %))
+                    (applicable-methods methods args pred-exceptions))
             args)
         values (map #(apply (:fn %) args) primaries)]
     (case op
@@ -309,12 +298,10 @@
 
 (defn- combine-default
   [methods args pred-exceptions]
-  (let [applies? (fn [spec arg] (applicable? spec arg pred-exceptions))
-        primaries
+  (let [primaries
           (sort-methods
-            (filter #(and (= :primary (:qualifier %))
-                          (every? true? (map applies? (:specializers %) args)))
-              methods)
+            (filter #(= :primary (:qualifier %))
+                    (applicable-methods methods args pred-exceptions))
             args)]
     (when-let [method (first primaries)] (apply (:fn method) args))))
 
@@ -337,7 +324,6 @@
   (let [generic (atom {:name name,
                        :methods [],
                        :next-index 0,
-                       :arity nil,
                        :combination (or (:combination opts) :standard),
                        :pred-exceptions (or (:pred-exceptions opts) :false)})]
     (with-meta (fn [& args] (invoke-generic generic args))
@@ -346,8 +332,7 @@
 (defn generic?
   [v]
   (let [var (cond (var? v) v
-                  (symbol? v) (resolve v)
-                  :else nil)
+                  (symbol? v) (resolve v))
         m (or (some-> var
                       meta)
               (meta v))]
@@ -356,8 +341,7 @@
 (defn generic
   [v]
   (let [var (cond (var? v) v
-                  (symbol? v) (resolve v)
-                  :else nil)]
+                  (symbol? v) (resolve v))]
     (ensure-generic var v)
     (-> (meta var)
         :generic)))
@@ -386,8 +370,8 @@
 
 (defmacro defgeneric
   [name & body]
-  (let [[doc body]
-          (if (string? (first body)) [(first body) (rest body)] [nil body])
+  (let [doc (when (string? (first body)) (first body))
+        body (if doc (rest body) body)
         opts (if (map? (first body)) (first body) {})]
     `(let [f# (make-generic '~name ~opts)
            v# (def ~(with-meta name (cond-> {} doc (assoc :doc doc))) f#)]

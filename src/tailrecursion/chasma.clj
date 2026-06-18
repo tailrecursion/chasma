@@ -93,13 +93,14 @@
   [^Actor actor]
   (->Lane (:universe actor) actor (->Serializer (ArrayDeque.) (atom false))))
 
-(defrecord Delivery [^Universe universe target ^Actor to from payload
-                     ^Serializer serializer retries])
+(defrecord Delivery [target ^Actor to from payload ^Serializer serializer retries])
 (defrecord Txn [^Universe universe sends becomes effects])
 
 (defn- new-tx [^Universe u] (->Txn u (atom []) (atom []) (atom [])))
 
 (declare commit!)
+
+(defn- delivery-universe [^Delivery d] (:universe (:to d)))
 
 (defn- target-delivery [target]
   (cond
@@ -110,17 +111,17 @@
     :else
       (throw (IllegalArgumentException. "Expected an actor or lane target"))))
 
-(defn- enqueue! [^Universe u ^Delivery d]
-  (ensure-running! u)
-  (.put (:queue u) d))
+(defn- put-delivery! [^Delivery d]
+  (.put (:queue (delivery-universe d)) d))
 
-(defn- enqueue-committed! [^Universe u ^Delivery d]
-  (.put (:queue u) d))
+(defn- enqueue! [^Delivery d]
+  (ensure-running! (delivery-universe d))
+  (put-delivery! d))
 
 (defn- stage-or-enqueue! [^Delivery d]
   (if *tx*
     (swap! (:sends *tx*) conj d)
-    (enqueue! (:universe d) d))
+    (enqueue! d))
   nil)
 
 (defn send!
@@ -129,58 +130,52 @@
   (let [[u target actor serializer] (target-delivery target)]
     (ensure-running! u)
     (stage-or-enqueue!
-      (->Delivery u target actor *self-target* (vec xs) serializer 0))))
+      (->Delivery target actor *self-target* (vec xs) serializer 0))))
 
-(defn- validate-pairs [more]
+(defn- become-pairs [act new more]
   (when (odd? (count more))
     (throw (IllegalArgumentException. "become! requires actor/behavior pairs")))
-  nil)
-
-(defn- pair-universe [pairs]
-  (let [u (:universe (ffirst pairs))]
+  (let [pairs (vec (cons [act new] (partition 2 more)))
+        u (:universe (ffirst pairs))]
     (doseq [[actor _] pairs]
       (when-not (instance? Actor actor)
         (throw (IllegalArgumentException. "become! requires actor/behavior pairs")))
       (when-not (identical? u (:universe actor))
         (throw (IllegalArgumentException.
                  "become! cannot atomically update actors from multiple universes"))))
-    u))
+    [u pairs]))
 
 (defn- enqueue-becomes! [tx pairs]
-  (let [u (:universe tx)]
-    (doseq [[^Actor actor beh] pairs]
-      (when-not (identical? u (:universe actor))
-        (throw (IllegalArgumentException.
-                 "become! cannot atomically update actors from multiple universes")))
-      (let [observed @(.-beh actor)]
-        (swap! (:becomes tx) conj {:actor actor :old observed :new beh})))))
+  (doseq [[^Actor actor beh] pairs]
+    (let [observed @(.-beh actor)]
+      (swap! (:becomes tx) conj {:actor actor :old observed :new beh}))))
 
-(defn- apply-become-pairs! [pairs]
-  (let [u (pair-universe pairs)]
-    (if *tx*
-      (do
-        (enqueue-becomes! *tx* pairs)
-        nil)
-      (loop []
-        (let [tx (new-tx u)]
-          (enqueue-becomes! tx pairs)
-          (if (try
-                (commit! tx)
-                true
-                (catch Throwable _
-                  false))
-            nil
-            (recur)))))))
+(defn- apply-become-pairs! [u pairs]
+  (when (and *tx* (not (identical? u (:universe *tx*))))
+    (throw (IllegalArgumentException.
+             "become! cannot atomically update actors from multiple universes")))
+  (if *tx*
+    (enqueue-becomes! *tx* pairs)
+    (loop []
+      (let [tx (new-tx u)]
+        (enqueue-becomes! tx pairs)
+        (if (try
+              (commit! tx)
+              true
+              (catch Throwable _
+                false))
+          nil
+          (recur))))))
 
 (defn become!
   "Schedule one or more behavior changes. Inside a turn, the changes defer to commit.
    Outside a turn, all provided actor/behavior pairs apply atomically."
   ([^Actor act new-beh]
-   (apply-become-pairs! [[act new-beh]]))
+   (let [[u pairs] (become-pairs act new-beh ())]
+     (apply-become-pairs! u pairs)))
   ([^Actor act new-beh & more]
-   (validate-pairs more)
-   (let [pairs (vec (cons [act new-beh] (partition 2 more)))]
-     (apply-become-pairs! pairs))))
+   (let [[u pairs] (become-pairs act new-beh more)]
+     (apply-become-pairs! u pairs))))
 
 (defn ask
   "Request/response helper. Returns a CompletableFuture that completes with the reply.
@@ -194,7 +189,7 @@
             (fn [v]
               (.complete fut v)
               (become! me (fn [& _] nil))))
-    (stage-or-enqueue! (->Delivery u target actor me (vec msg) serializer 0))
+    (stage-or-enqueue! (->Delivery target actor me (vec msg) serializer 0))
     fut))
 
 (defmacro on-commit!
@@ -234,7 +229,7 @@
 
 (defn- validate-staged-sends! [sends]
   (doseq [^Delivery d sends]
-    (ensure-running! (:universe d))))
+    (ensure-running! (delivery-universe d))))
 
 (defn- commit! [^Txn tx]
   (let [sends   @(:sends tx)
@@ -249,7 +244,7 @@
         (doseq [{:keys [^Actor actor new]} becomes]
           (reset! (.-beh actor) new))))
     (doseq [^Delivery d sends]
-      (enqueue-committed! (:universe d) d))
+      (put-delivery! d))
     (run-commit-effects! (:universe tx) @(:effects tx))))
 
 (defn- backoff-ms [^Universe u n]
@@ -260,7 +255,7 @@
 
 (defn- retry-delivery [^Delivery d]
   (let [n  (inc (long (:retries d)))
-        ms (backoff-ms (:universe d) n)]
+        ms (backoff-ms (delivery-universe d) n)]
     (when (pos? ms)
       (try (.sleep TimeUnit/MILLISECONDS ms) (catch InterruptedException _)))
     (assoc d :retries n)))
@@ -284,10 +279,9 @@
 
 (defn- run-with-retries! [^Delivery d]
   (loop [d d]
-    (when @(:running? (:universe d))
+    (when @(:running? (delivery-universe d))
       (when-let [retry (try
                          (run-turn! d)
-                         nil
                          (catch Throwable _
                            (retry-delivery d)))]
         (recur retry)))))
@@ -302,9 +296,7 @@
   (ensure-running! u)
   (let [start? (locking s
                  (.addLast ^ArrayDeque (:queue s) d)
-                 (when-not @(:running? s)
-                   (reset! (:running? s) true)
-                   true))]
+                 (compare-and-set! (:running? s) false true))]
     (when start?
       (schedule-serializer! u s))))
 
@@ -324,14 +316,11 @@
         (recur)))))
 
 (defn- run-delivery! [^Delivery d]
-  (if-let [s (:serializer d)]
-    (enqueue-serialized! (:universe d) s d)
-    (when-let [retry (try
-                       (run-turn! d)
-                       nil
-                       (catch Throwable _
-                         (retry-delivery d)))]
-      (enqueue! (:universe retry) retry))))
+  (when-let [retry (try
+                     (run-turn! d)
+                     (catch Throwable _
+                       (retry-delivery d)))]
+    (enqueue! retry)))
 
 (defn- pump-loop [^Universe u]
   (future
@@ -340,7 +329,7 @@
       (while @(:running? u)
         (when-let [^Delivery d (.poll queue poll-ms TimeUnit/MILLISECONDS)]
           (if-let [s (:serializer d)]
-            (enqueue-serialized! (:universe d) s d)
+            (enqueue-serialized! (delivery-universe d) s d)
             (when-let [^ExecutorService executor @(:pool u)]
               (.submit executor ^Runnable #(run-delivery! d)))))))))
 
