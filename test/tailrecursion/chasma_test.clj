@@ -168,7 +168,8 @@
 
 (use-fixtures :once
   (fn [f]
-    (reset! test-universe (ch/start! (ch/universe)))
+    (reset! test-universe
+            (ch/start! (ch/universe {:effect-error-handler (fn [_])})))
     (try
       (f)
       (finally
@@ -361,7 +362,9 @@
   (is (thrown? IllegalArgumentException (ch/universe {:pump-poll-ms -1})))
   (is (thrown? IllegalArgumentException (ch/universe {:retry-base-ms -1})))
   (is (thrown? IllegalArgumentException
-               (ch/universe {:retry-base-ms 10 :retry-max-ms 5}))))
+               (ch/universe {:retry-base-ms 10 :retry-max-ms 5})))
+  (is (thrown? IllegalArgumentException
+               (ch/universe {:effect-error-handler :not-a-fn}))))
 
 (deftest single-thread-universe-serializes-direct-deliveries
   (let [u        (ch/start! (ch/universe {:threads 1}))

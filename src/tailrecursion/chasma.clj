@@ -9,7 +9,11 @@
   {:threads (max 2 (.availableProcessors (Runtime/getRuntime)))
    :pump-poll-ms 100
    :retry-base-ms 5
-   :retry-max-ms 500})
+   :retry-max-ms 500
+   :effect-error-handler (fn [^Throwable t]
+                           (binding [*out* *err*]
+                             (println "on-commit! effect failed:"
+                                      (.getMessage t))))})
 
 (defrecord Universe [^LinkedBlockingQueue queue ^Atom running? ^Atom pool
                      ^Atom pump opts])
@@ -30,14 +34,18 @@
   (when (< (:retry-max-ms opts) (:retry-base-ms opts))
     (throw (IllegalArgumentException.
              ":retry-max-ms must be greater than or equal to :retry-base-ms")))
+  (when-not (fn? (:effect-error-handler opts))
+    (throw (IllegalArgumentException.
+             ":effect-error-handler must be a function")))
   opts)
 
 (defn universe
   "Create a stopped universe. Options:
    :threads       worker thread count
    :pump-poll-ms  dispatcher poll interval
-   :retry-base-ms retry backoff base
-   :retry-max-ms  retry backoff cap"
+   :retry-base-ms       retry backoff base
+   :retry-max-ms        retry backoff cap
+   :effect-error-handler fn called with on-commit! effect failures"
   (^Universe []
    (universe {}))
   (^Universe [opts]
@@ -216,17 +224,13 @@
               (f)))]
     (step (sort-by :id actors))))
 
-(defn- report-effect-failure! [^Throwable t]
-  (binding [*out* *err*]
-    (println "on-commit! effect failed:" (.getMessage t))))
-
-(defn- run-commit-effects! [effects]
+(defn- run-commit-effects! [^Universe u effects]
   (doseq [f effects]
     (try
       (binding [*tx* nil]
         (f))
       (catch Throwable t
-        (report-effect-failure! t)))))
+        ((:effect-error-handler (:opts u)) t)))))
 
 (defn- validate-staged-sends! [sends]
   (doseq [^Delivery d sends]
@@ -246,7 +250,7 @@
           (reset! (.-beh actor) new))))
     (doseq [^Delivery d sends]
       (enqueue-committed! (:universe d) d))
-    (run-commit-effects! @(:effects tx))))
+    (run-commit-effects! (:universe tx) @(:effects tx))))
 
 (defn- backoff-ms [^Universe u n]
   (let [{:keys [retry-base-ms retry-max-ms]} (:opts u)]

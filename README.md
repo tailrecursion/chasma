@@ -61,7 +61,7 @@ Coordinating concurrent workflows typically requires explicit thread management,
 
 | Var | Description |
 | --- | ----------- |
-| `universe` | Creates a stopped runtime universe. Accepts `{:threads n :pump-poll-ms n :retry-base-ms n :retry-max-ms n}`. |
+| `universe` | Creates a stopped runtime universe. Accepts `{:threads n :pump-poll-ms n :retry-base-ms n :retry-max-ms n :effect-error-handler f}`. |
 | `start! universe` | Starts a universe; idempotent and returns the universe. |
 | `stop! universe` | Stops a universe and shuts down its worker pool; idempotent and returns the universe. |
 | `spawn universe behavior-fn` | Creates an actor whose behavior is a variadic fn. Returns an `Actor` record. |
