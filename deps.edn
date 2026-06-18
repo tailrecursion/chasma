@@ -1,4 +1,17 @@
-{:paths ["src"]
- :deps {org.clojure/clojure {:mvn/version "1.12.3"}}
- :aliases {:test {:extra-paths ["test"]
-                  :main-opts ["-m" "tailrecursion.test-runner"]}}}
+{:aliases {:fmt {:main-opts ["-m" "zprint.main" "-w" "deps.edn" ".zprintrc"
+                             ".clj-kondo/config.edn"
+                             ".clj-kondo/hooks/tailrecursion/chasma/clos.clj"
+                             "src/tailrecursion/chasma.clj"
+                             "src/tailrecursion/chasma/clos.clj"
+                             "test/tailrecursion/chasma_test.clj"
+                             "test/tailrecursion/chasma_clos_test.clj"
+                             "test/tailrecursion/test_runner.clj"],
+                 :replace-deps {zprint/zprint {:mvn/version "1.3.0"}}},
+           :lint {:main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
+                              ".clj-kondo" "deps.edn"],
+                  :replace-deps {clj-kondo/clj-kondo {:mvn/version
+                                                        "2026.05.25"}}},
+           :test {:extra-paths ["test"],
+                  :main-opts ["-m" "tailrecursion.test-runner"]}},
+ :deps {org.clojure/clojure {:mvn/version "1.12.3"}},
+ :paths ["src"]}

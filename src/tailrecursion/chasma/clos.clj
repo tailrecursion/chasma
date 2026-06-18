@@ -3,6 +3,8 @@
   (:refer-clojure :exclude [defmethod])
   (:import (clojure.lang PersistentStructMap PersistentStructMap$Def)))
 
+(set! *warn-on-reflection* true)
+
 (def ^:dynamic *next-methods* nil)
 (def ^:dynamic *next-method-args* nil)
 
@@ -31,12 +33,11 @@
           (and (var? v) (instance? class @v)) @v)))
 
 (def ^:private struct-def-field
-  (doto (.getDeclaredField PersistentStructMap "def")
-    (.setAccessible true)))
+  (doto (.getDeclaredField PersistentStructMap "def") (.setAccessible true)))
 
 (defn- struct-def
   [^PersistentStructMap x]
-  (.get struct-def-field x))
+  (let [^java.lang.reflect.Field f struct-def-field] (.get f x)))
 
 (defn- struct-instance-of?
   [expected-def arg]
@@ -87,7 +88,8 @@
       (when-let [[c d] (peek queue)]
         (if (= c target)
           d
-          (let [queue (pop queue)
+          (let [^Class c c
+                queue (pop queue)
                 supers (remove nil?
                          (concat (when-let [s (.getSuperclass c)] [s])
                                  (.getInterfaces c)))
@@ -98,7 +100,8 @@
 
 (defn- subset? [a b] (every? #(contains? b %) a))
 
-(defn- finite-in-set [spec]
+(defn- finite-in-set
+  [spec]
   (let [s (:set spec)]
     (cond (set? s) s
           (map? s) (set (keys s))
@@ -109,67 +112,59 @@
   [m key value]
   (and (contains? m key) (= (get m key) value)))
 
-(defn- implies-specializer? [a b]
+(defn- implies-specializer?
+  [a b]
   (let [ak (:kind a)
         bk (:kind b)]
     (or (= bk :any)
         (= a b)
         (case ak
-          :value
-            (let [v (:value a)]
-              (case bk
-                :in (in-contains? (:set b) v)
-                :class (instance? (:class b) v)
-                :isa (isa? v (:value b))
-                false))
-          :in
-            (case bk
-              :in (let [as (finite-in-set a)
-                        bs (finite-in-set b)]
-                    (and as bs (subset? as bs)))
-              false)
-          :struct
-            (case bk
-              :struct (identical? (:struct a) (:struct b))
-              :class (.isAssignableFrom ^Class (:class b) PersistentStructMap)
-              false)
-          :map=
-            (let [m (:map a)]
-              (case bk
-                :map= (every? (fn [[k v]] (map-entry-implies-key=?
-                                             m k v))
-                        (:map b))
-                :key= (map-entry-implies-key=? m (:key b) (:value b))
-                :keys (subset? (set (:keys b)) (set (keys m)))
-                false))
-          :key=
-            (case bk
-              :key= (and (= (:key a) (:key b))
-                         (= (:value a) (:value b)))
-              :keys (contains? (set (:keys b)) (:key a))
-              false)
-          :keys
-            (case bk
-              :keys (subset? (set (:keys b)) (set (:keys a)))
-              false)
-          :keys=
-            (case bk
-              :keys= (= (:keys a) (:keys b))
-              :keys (subset? (set (:keys b)) (:keys a))
-              false)
-          :class
-            (case bk
-              :class (.isAssignableFrom ^Class (:class b) ^Class (:class a))
-              false)
-          :isa
-            (case bk
-              :isa (isa? (:value a) (:value b))
-              false)
+          :value (let [v (:value a)]
+                   (case bk
+                     :in (in-contains? (:set b) v)
+                     :class (instance? (:class b) v)
+                     :isa (isa? v (:value b))
+                     false))
+          :in (case bk
+                :in (let [as (finite-in-set a)
+                          bs (finite-in-set b)]
+                      (and as bs (subset? as bs)))
+                false)
+          :struct (case bk
+                    :struct (identical? (:struct a) (:struct b))
+                    :class (.isAssignableFrom ^Class (:class b)
+                                              PersistentStructMap)
+                    false)
+          :map= (let [m (:map a)]
+                  (case bk
+                    :map= (every? (fn [[k v]] (map-entry-implies-key=? m k v))
+                                  (:map b))
+                    :key= (map-entry-implies-key=? m (:key b) (:value b))
+                    :keys (subset? (set (:keys b)) (set (keys m)))
+                    false))
+          :key= (case bk
+                  :key= (and (= (:key a) (:key b)) (= (:value a) (:value b)))
+                  :keys (contains? (set (:keys b)) (:key a))
+                  false)
+          :keys (case bk
+                  :keys (subset? (set (:keys b)) (set (:keys a)))
+                  false)
+          :keys= (case bk
+                   :keys= (= (:keys a) (:keys b))
+                   :keys (subset? (set (:keys b)) (:keys a))
+                   false)
+          :class (case bk
+                   :class (.isAssignableFrom ^Class (:class b)
+                                             ^Class (:class a))
+                   false)
+          :isa (case bk
+                 :isa (isa? (:value a) (:value b))
+                 false)
           false))))
 
-(defn- dominates-specializer? [a b]
-  (and (implies-specializer? a b)
-       (not (implies-specializer? b a))))
+(defn- dominates-specializer?
+  [a b]
+  (and (implies-specializer? a b) (not (implies-specializer? b a))))
 
 (defn- specificity-score
   [spec arg]
@@ -189,23 +184,22 @@
     :any [11 0]
     [12 0]))
 
-(defn- compare-specializers [s1 s2 arg]
+(defn- compare-specializers
+  [s1 s2 arg]
   (cond (dominates-specializer? s1 s2) -1
         (dominates-specializer? s2 s1) 1
-        :else (compare (specificity-score s1 arg)
-                       (specificity-score s2 arg))))
+        :else (compare (specificity-score s1 arg) (specificity-score s2 arg))))
 
-(defn- compare-methods [m1 m2 args]
+(defn- compare-methods
+  [m1 m2 args]
   (loop [specs1 (:specializers m1)
          specs2 (:specializers m2)
          args args]
     (if (or (empty? specs1) (empty? specs2))
       0
-      (let [cmp (compare-specializers (first specs1) (first specs2)
-                                      (first args))]
-        (if (zero? cmp)
-          (recur (rest specs1) (rest specs2) (rest args))
-          cmp)))))
+      (let [cmp
+              (compare-specializers (first specs1) (first specs2) (first args))]
+        (if (zero? cmp) (recur (rest specs1) (rest specs2) (rest args)) cmp)))))
 
 (defn- more-specific?
   [m1 m2 args]
@@ -225,10 +219,10 @@
     (let [method (first methods)
           next-fn (method-chain (rest methods) base)]
       (fn [& args]
-        (binding [*next-methods*
-                    (if (and next-fn (not (identical? next-fn no-next-method)))
-                      (list next-fn)
-                      nil)
+        (binding [*next-methods* (when (and next-fn
+                                            (not (identical? next-fn
+                                                             no-next-method)))
+                                   (list next-fn))
                   *next-method-args* args]
           (apply (:fn method) args))))))
 
@@ -243,11 +237,11 @@
   (let [applies? (fn [spec arg] (applicable? spec arg pred-exceptions))]
     (filter #(every? true? (map applies? (:specializers %) args)) methods)))
 
-(defn- primary-methods [methods args pred-exceptions]
-  (sort-methods
-    (filter #(= :primary (:qualifier %))
-            (applicable-methods methods args pred-exceptions))
-    args))
+(defn- primary-methods
+  [methods args pred-exceptions]
+  (sort-methods (filter #(= :primary (:qualifier %))
+                  (applicable-methods methods args pred-exceptions))
+                args))
 
 (defn- combine-standard
   [methods args pred-exceptions]
@@ -367,62 +361,61 @@
   [name & body]
   (let [emit-specializer
           (fn [spec]
-            (cond (= spec :any) {:kind :any}
-                  (= spec :default) {:kind :any}
-                  (= spec 't) {:kind :any}
-                  (= spec '_) {:kind :any}
-                  (and (seq? spec) (= 'key= (first spec)))
-                    (let [[_ k v] spec] `{:kind :key=, :key ~k, :value ~v})
-                  (and (seq? spec) (= 'op (first spec)))
-                    (let [v (second spec)] `{:kind :key=, :key :op, :value ~v})
-                  (and (seq? spec) (= 'keys= (first spec)))
-                    (let [ks (rest spec)] `{:kind :keys=, :keys ~(set ks)})
-                  (and (seq? spec) (= 'has-keys (first spec)))
-                    (let [ks (rest spec)] `{:kind :keys, :keys ~(vec ks)})
-                  (and (seq? spec) (= 'in (first spec)))
-                    (let [s (second spec)] `{:kind :in, :set ~s})
-                  (set? spec) `{:kind :in, :set ~spec}
-                  (map? spec) `{:kind :map=, :map ~spec}
-                  (and (seq? spec) (= 'isa? (first spec)))
-                    (let [v (second spec)] `{:kind :isa, :value ~v})
-                  (and (seq? spec) (= 'map-of (first spec)))
-                    (let [[_ kp vp] spec]
-                      (cond (and (symbol? kp) (symbol? vp))
-                              `{:kind :map-of,
-                                :kpred (deref (var ~kp)),
-                                :vpred (deref (var ~vp))}
-                            (symbol? kp) `{:kind :map-of,
-                                           :kpred (deref (var ~kp)),
-                                           :vpred ~vp}
-                            (symbol? vp) `{:kind :map-of,
-                                           :kpred ~kp,
-                                           :vpred (deref (var ~vp))}
-                            :else `{:kind :map-of, :kpred ~kp, :vpred ~vp}))
-                  (or (keyword? spec)
-                      (string? spec)
-                      (number? spec)
-                      (char? spec)
-                      (boolean? spec)
-                      (nil? spec))
-                    `{:kind :value, :value ~spec}
-                  (and (seq? spec) (= 'pred (first spec)))
-                    (let [p (second spec)]
-                      (cond (symbol? p) `{:kind :pred, :pred (deref (var ~p))}
-                            :else `{:kind :pred, :pred ~p}))
-                  (and (seq? spec) (= 'satisfies (first spec)))
-                    (let [p (second spec)]
-                      (cond (symbol? p) `{:kind :satisfies,
-                                          :protocol (deref (var ~p))}
-                            :else `{:kind :satisfies, :protocol ~p}))
-                  (symbol? spec) (if (resolve-instance spec PersistentStructMap$Def)
-                                   `{:kind :struct, :struct (deref (var ~spec))}
-                                   (if-let [c (resolve-instance spec Class)]
-                                     {:kind :class, :class c}
-                                     (throw (ex-info "Unknown class specializer"
-                                                     {:specializer spec}))))
-                  (instance? Class spec) {:kind :class, :class spec}
-                  :else (throw (ex-info "Invalid specializer"
-                                        {:specializer spec}))))
+            (cond
+              (= spec :any) {:kind :any}
+              (= spec :default) {:kind :any}
+              (= spec 't) {:kind :any}
+              (= spec '_) {:kind :any}
+              (and (seq? spec) (= 'key= (first spec)))
+                (let [[_ k v] spec] `{:kind :key=, :key ~k, :value ~v})
+              (and (seq? spec) (= 'op (first spec)))
+                (let [v (second spec)] `{:kind :key=, :key :op, :value ~v})
+              (and (seq? spec) (= 'keys= (first spec)))
+                (let [ks (rest spec)] `{:kind :keys=, :keys ~(set ks)})
+              (and (seq? spec) (= 'has-keys (first spec)))
+                (let [ks (rest spec)] `{:kind :keys, :keys ~(vec ks)})
+              (and (seq? spec) (= 'in (first spec))) (let [s (second spec)]
+                                                       `{:kind :in, :set ~s})
+              (set? spec) `{:kind :in, :set ~spec}
+              (map? spec) `{:kind :map=, :map ~spec}
+              (and (seq? spec) (= 'isa? (first spec)))
+                (let [v (second spec)] `{:kind :isa, :value ~v})
+              (and (seq? spec) (= 'map-of (first spec)))
+                (let [[_ kp vp] spec]
+                  (cond (and (symbol? kp) (symbol? vp))
+                          `{:kind :map-of,
+                            :kpred (deref (var ~kp)),
+                            :vpred (deref (var ~vp))}
+                        (symbol? kp)
+                          `{:kind :map-of, :kpred (deref (var ~kp)), :vpred ~vp}
+                        (symbol? vp)
+                          `{:kind :map-of, :kpred ~kp, :vpred (deref (var ~vp))}
+                        :else `{:kind :map-of, :kpred ~kp, :vpred ~vp}))
+              (or (keyword? spec)
+                  (string? spec)
+                  (number? spec)
+                  (char? spec)
+                  (boolean? spec)
+                  (nil? spec))
+                `{:kind :value, :value ~spec}
+              (and (seq? spec) (= 'pred (first spec)))
+                (let [p (second spec)]
+                  (cond (symbol? p) `{:kind :pred, :pred (deref (var ~p))}
+                        :else `{:kind :pred, :pred ~p}))
+              (and (seq? spec) (= 'satisfies (first spec)))
+                (let [p (second spec)]
+                  (cond (symbol? p) `{:kind :satisfies,
+                                      :protocol (deref (var ~p))}
+                        :else `{:kind :satisfies, :protocol ~p}))
+              (symbol? spec) (if (resolve-instance spec PersistentStructMap$Def)
+                               `{:kind :struct, :struct (deref (var ~spec))}
+                               (if-let [c (resolve-instance spec Class)]
+                                 {:kind :class, :class c}
+                                 (throw (ex-info "Unknown class specializer"
+                                                 {:specializer spec}))))
+              (instance? Class spec) {:kind :class, :class spec}
+              :else (throw (ex-info "Invalid specializer"
+                                    {:specializer spec}))))
         [qualifier body] (if (keyword? (first body))
                            [(first body) (rest body)]
                            [:primary body])

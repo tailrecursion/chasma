@@ -3,10 +3,11 @@
             tailrecursion.chasma-clos-test
             tailrecursion.chasma-test))
 
+(set! *warn-on-reflection* true)
+
 (defn -main
   [& _]
   (let [{:keys [fail error]} (t/run-tests 'tailrecursion.chasma-test
                                           'tailrecursion.chasma-clos-test)]
     (shutdown-agents)
-    (when (pos? (+ fail error))
-      (System/exit 1))))
+    (when (pos? (+ fail error)) (System/exit 1))))

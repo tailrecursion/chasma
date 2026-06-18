@@ -103,7 +103,8 @@
 (clos/defgeneric multi-arg-dominance)
 
 (clos/defmethod multi-arg-dominance [(m {:a 1}) (x String)] :first-arg)
-(clos/defmethod multi-arg-dominance [(m {:a 1, :b 2}) (x Object)] :dominates-left)
+(clos/defmethod multi-arg-dominance [(m {:a 1, :b 2}) (x Object)]
+  :dominates-left)
 (clos/defmethod multi-arg-dominance [(m {:a 1}) (x Object)] :fallback)
 
 (deftest multi-arg-specificity-is-left-to-right
