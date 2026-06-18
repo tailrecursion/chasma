@@ -1,0 +1,4 @@
+((clojure-mode
+  . ((cider-preferred-build-tool . clojure-cli)
+     (cider-clojure-cli-aliases . ":test")
+     (compile-command . "clojure -M:test"))))
