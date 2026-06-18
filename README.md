@@ -21,17 +21,20 @@ Coordinating concurrent workflows typically requires explicit thread management,
       nil)))
 
 (defn demo []
-  (ch/start!)
-  (let [c (ch/lane (ch/spawn (counter 0)))]
-    (ch/send! c :inc)
-    (ch/send! c :inc)
-    ;; print 2
-    (println (deref (ch/ask c :get))))
-  (ch/shutdown!))
+  (let [u (ch/start! (ch/universe))
+        c (ch/lane (ch/spawn u (counter 0)))]
+    (try
+      (ch/send! c :inc)
+      (ch/send! c :inc)
+      ;; print 2
+      (println (deref (ch/ask c :get)))
+      (finally
+        (ch/stop! u)))))
 
 ;; Mutually recursive even/odd predicates (SICP-style)
-(def evenA (ch/spawn))
-(def oddA  (ch/spawn))
+(def u (ch/start! (ch/universe)))
+(def evenA (ch/spawn u))
+(def oddA  (ch/spawn u))
 
 (defn even-beh
   ([n] (even-beh n ch/*sender*))
@@ -49,20 +52,22 @@ Coordinating concurrent workflows typically requires explicit thread management,
 
 (ch/become! evenA even-beh oddA odd-beh)
 
-(ch/start!)
 (println @(ch/ask evenA 42)) ;; => true
 (println @(ch/ask oddA 17)) ;; => true
-(ch/shutdown!)
+(ch/stop! u)
 ```
 
 ## API Overview
 
 | Var | Description |
 | --- | ----------- |
-| `start!` | Starts the dispatcher; idempotent. |
-| `shutdown!` | Stops the dispatcher and shuts down the worker pool. |
-| `spawn behavior-fn` | Creates an actor whose behavior is a variadic fn. Returns an `Actor` record. |
-| `lane actor` | Creates a private serialized target for an actor. |
+| `universe` | Creates a stopped runtime universe. Accepts `{:threads n :pump-poll-ms n :retry-base-ms n :retry-max-ms n}`. |
+| `start! universe` | Starts a universe; idempotent and returns the universe. |
+| `stop! universe` | Stops a universe and shuts down its worker pool; idempotent and returns the universe. |
+| `spawn universe behavior-fn` | Creates an actor whose behavior is a variadic fn. Returns an `Actor` record. |
+| `spawn universe` | Creates a no-op actor in a universe. |
+| `spawn behavior-fn` | Inside a turn only, creates an actor in `*universe*`. |
+| `lane actor` | Creates a private serialized target for an actor in the actor's universe. |
 | `send! target & msg` | Enqueues a message to an actor or lane target. |
 | `become! actor new-beh ...` | Schedules one or more behavior changes. Inside a turn it buffers until commit; outside it applies atomically. |
 | `ask target & msg` | Sends a request to an actor or lane target and returns a `java.util.concurrent.CompletableFuture` (supports `deref`). |
@@ -70,12 +75,13 @@ Coordinating concurrent workflows typically requires explicit thread management,
 
 ## Execution Model
 
-- Each delivery runs inside an implicit transaction buffer. All outbound `send!` and `ask` deliveries and any number of `become!` updates made during a behavior execute only after the behavior returns successfully.
+- A `Universe` owns a queue, worker pool, retry settings, and lifecycle. Actors and lanes are bound to one universe.
+- Each delivery runs inside an implicit transaction buffer. All outbound `send!` and `ask` deliveries and any number of same-universe `become!` updates made during a behavior execute only after the behavior returns successfully.
 - A thrown exception or compare-and-set failure during commit discards the buffered effects and re-enqueues the message with bounded exponential backoff.
 - `on-commit!` schedules irreversible effects (logging, IO, etc.) and can only be invoked inside a turn; failures before commit drop the effect entirely. Once state has committed, `on-commit!` failures are reported and do not retry the turn.
 - `lane` creates a serialized target/capability for an actor. Mail sent through one lane is processed FIFO, one full delivery turn at a time; separate lanes for the same actor remain independent.
 - Messages sent while an actor is executing through a lane preserve that lane as the reply capability, so callees can reply through the same serialized target.
-- Work is pulled from a single queue by a fixed thread pool; actors are identity envelopes around mutable behavior atoms.
+- `send!` and `ask` infer delivery ownership from the target. Stopped universes reject new sends and asks.
 
 ## Dynamic Vars
 
@@ -83,6 +89,7 @@ Available inside every behavior:
 
 | Var | Meaning |
 | --- | ------- |
+| `*universe*` | The universe currently executing. |
 | `*self*` | The actor envelope currently executing. |
 | `*sender*` | Reply target/capability for the current message, such as an actor, lane, or `nil`. |
 | `*reply*` | Convenience fn `(fn [v])` that sends a reply back to `*sender*`. |

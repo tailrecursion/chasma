@@ -1,93 +1,168 @@
 (ns tailrecursion.chasma
   "Transactional actor runtime for Clojure"
   (:import (java.util ArrayDeque UUID)
-           (java.util.concurrent Executors LinkedBlockingQueue TimeUnit CompletableFuture ExecutorService)
+           (java.util.concurrent CompletableFuture ExecutorService Executors
+                                 LinkedBlockingQueue TimeUnit)
            (clojure.lang Atom)))
 
-(defrecord Actor [^UUID id ^Atom beh])
+(def ^:private default-options
+  {:threads (max 2 (.availableProcessors (Runtime/getRuntime)))
+   :pump-poll-ms 100
+   :retry-base-ms 5
+   :retry-max-ms 500})
+
+(defrecord Universe [^LinkedBlockingQueue queue ^Atom running? ^Atom pool
+                     ^Atom pump opts])
+(defrecord Actor [^Universe universe ^UUID id ^Atom beh])
 (defrecord Serializer [^ArrayDeque queue ^Atom running?])
-(defrecord Lane [^Actor target ^Serializer serializer])
+(defrecord Lane [^Universe universe ^Actor target ^Serializer serializer])
+
+(defn- non-negative-int? [x] (and (integer? x) (not (neg? x))))
+(defn- positive-int? [x] (and (integer? x) (pos? x)))
+
+(defn- validate-options [opts]
+  (when-not (positive-int? (:threads opts))
+    (throw (IllegalArgumentException. ":threads must be a positive integer")))
+  (doseq [k [:pump-poll-ms :retry-base-ms :retry-max-ms]]
+    (when-not (non-negative-int? (k opts))
+      (throw (IllegalArgumentException.
+               (str (name k) " must be a non-negative integer")))))
+  (when (< (:retry-max-ms opts) (:retry-base-ms opts))
+    (throw (IllegalArgumentException.
+             ":retry-max-ms must be greater than or equal to :retry-base-ms")))
+  opts)
+
+(defn universe
+  "Create a stopped universe. Options:
+   :threads       worker thread count
+   :pump-poll-ms  dispatcher poll interval
+   :retry-base-ms retry backoff base
+   :retry-max-ms  retry backoff cap"
+  (^Universe []
+   (universe {}))
+  (^Universe [opts]
+   (let [opts (validate-options (merge default-options opts))]
+     (->Universe (LinkedBlockingQueue.) (atom false) (atom nil) (atom nil)
+                 opts))))
+
+(def ^:dynamic *universe* nil)
+(def ^:dynamic *self*     nil)
+(def ^:private ^:dynamic *self-target* nil)
+(def ^:dynamic *sender*   nil)
+(def ^:dynamic *reply*    (fn [_] (throw (ex-info "No sender to reply to" {}))))
+(def ^:dynamic *tx*       nil)
+
+(defn- ensure-universe [u]
+  (when-not (instance? Universe u)
+    (throw (IllegalArgumentException. "Expected a Chasma universe")))
+  u)
+
+(defn- ensure-running! [^Universe u]
+  (when-not @(:running? u)
+    (throw (IllegalStateException. "Universe is stopped")))
+  u)
+
+(defn- current-universe! []
+  (or *universe*
+      (throw (IllegalStateException.
+               "No current universe; pass a universe outside a turn"))))
 
 (defn spawn
-  "Create an actor from a behavior function (variadic fn). With no args, spawns a no-op actor."
+  "Create an actor. Outside a turn use (spawn universe) or (spawn universe beh).
+   Inside a turn, (spawn) and (spawn beh) use *universe*."
   (^Actor []
-   (spawn (constantly nil)))
-  (^Actor [beh]
-   (->Actor (UUID/randomUUID) (atom beh))))
+   (spawn (current-universe!) (constantly nil)))
+  (^Actor [u-or-beh]
+   (if (instance? Universe u-or-beh)
+     (spawn u-or-beh (constantly nil))
+     (spawn (current-universe!) u-or-beh)))
+  (^Actor [u beh]
+   (let [u (ensure-universe u)]
+     (->Actor u (UUID/randomUUID) (atom beh)))))
 
 (defn lane
   "Create a private serialized target for actor."
   [^Actor actor]
-  (->Lane actor (->Serializer (ArrayDeque.) (atom false))))
+  (->Lane (:universe actor) actor (->Serializer (ArrayDeque.) (atom false))))
 
-(def ^:private ^LinkedBlockingQueue queue (LinkedBlockingQueue.))
-(def ^:private running? (atom false))
-(def ^:private pool (atom nil))
-(def ^:private pump (atom nil))
+(defrecord Delivery [^Universe universe target ^Actor to from payload
+                     ^Serializer serializer retries])
+(defrecord Txn [^Universe universe sends becomes effects])
 
-(def ^:dynamic *self*   nil)
-(def ^:private ^:dynamic *self-target* nil)
-(def ^:dynamic *sender* nil)
-(def ^:dynamic *reply*  (fn [_] (throw (ex-info "No sender to reply to" {}))))
-(def ^:dynamic *tx*     nil)
-
-
-(defrecord Delivery [target ^Actor to from payload ^Serializer serializer retries])
-(defn- enqueue! [^Delivery d] (.put queue d))
-
-
-(defrecord Txn [sends becomes effects])
-
-(defn- new-tx [] (->Txn (atom []) (atom []) (atom [])))
+(defn- new-tx [^Universe u] (->Txn u (atom []) (atom []) (atom [])))
 
 (declare commit!)
 
 (defn- target-delivery [target]
-  (if (instance? Lane target)
-    [target (:target target) (:serializer target)]
-    [target target nil]))
+  (cond
+    (instance? Lane target)
+      [(:universe target) target (:target target) (:serializer target)]
+    (instance? Actor target)
+      [(:universe target) target target nil]
+    :else
+      (throw (IllegalArgumentException. "Expected an actor or lane target"))))
+
+(defn- enqueue! [^Universe u ^Delivery d]
+  (ensure-running! u)
+  (.put (:queue u) d))
+
+(defn- enqueue-committed! [^Universe u ^Delivery d]
+  (.put (:queue u) d))
 
 (defn- stage-or-enqueue! [^Delivery d]
   (if *tx*
     (swap! (:sends *tx*) conj d)
-    (enqueue! d))
+    (enqueue! (:universe d) d))
   nil)
 
 (defn send!
-  "Send a message to target.
-
-   Outside a behavior, enqueues immediately.
-   Inside a behavior (turn), buffers in *tx* and flushes on commit."
+  "Send a message to an actor or lane target."
   [target & xs]
-  (let [[target actor serializer] (target-delivery target)]
+  (let [[u target actor serializer] (target-delivery target)]
+    (ensure-running! u)
     (stage-or-enqueue!
-      (->Delivery target actor *self-target* (vec xs) serializer 0))))
+      (->Delivery u target actor *self-target* (vec xs) serializer 0))))
 
 (defn- validate-pairs [more]
   (when (odd? (count more))
     (throw (IllegalArgumentException. "become! requires actor/behavior pairs")))
   nil)
 
+(defn- pair-universe [pairs]
+  (let [u (:universe (ffirst pairs))]
+    (doseq [[actor _] pairs]
+      (when-not (instance? Actor actor)
+        (throw (IllegalArgumentException. "become! requires actor/behavior pairs")))
+      (when-not (identical? u (:universe actor))
+        (throw (IllegalArgumentException.
+                 "become! cannot atomically update actors from multiple universes"))))
+    u))
+
 (defn- enqueue-becomes! [tx pairs]
-  (doseq [[^Actor actor beh] pairs]
-    (let [observed @(.-beh actor)]
-      (swap! (:becomes tx) conj {:actor actor :old observed :new beh}))))
+  (let [u (:universe tx)]
+    (doseq [[^Actor actor beh] pairs]
+      (when-not (identical? u (:universe actor))
+        (throw (IllegalArgumentException.
+                 "become! cannot atomically update actors from multiple universes")))
+      (let [observed @(.-beh actor)]
+        (swap! (:becomes tx) conj {:actor actor :old observed :new beh})))))
 
 (defn- apply-become-pairs! [pairs]
-  (if *tx*
-    (do
-      (enqueue-becomes! *tx* pairs)
-      nil)
-    (loop []
-      (let [tx (new-tx)]
-        (enqueue-becomes! tx pairs)
-        (if (try
-              (commit! tx)
-              true
-              (catch Throwable _
-                false))
-          nil
-          (recur))))))
+  (let [u (pair-universe pairs)]
+    (if *tx*
+      (do
+        (enqueue-becomes! *tx* pairs)
+        nil)
+      (loop []
+        (let [tx (new-tx u)]
+          (enqueue-becomes! tx pairs)
+          (if (try
+                (commit! tx)
+                true
+                (catch Throwable _
+                  false))
+            nil
+            (recur)))))))
 
 (defn become!
   "Schedule one or more behavior changes. Inside a turn, the changes defer to commit.
@@ -96,21 +171,22 @@
    (apply-become-pairs! [[act new-beh]]))
   ([^Actor act new-beh & more]
    (validate-pairs more)
-   (let [pairs (cons [act new-beh] (partition 2 more))]
+   (let [pairs (vec (cons [act new-beh] (partition 2 more)))]
      (apply-become-pairs! pairs))))
 
 (defn ask
   "Request/response helper. Returns a CompletableFuture that completes with the reply.
    Inside the callee, call (*reply* value) to answer."
   [target & msg]
-  (let [[target actor serializer] (target-delivery target)
+  (let [[u target actor serializer] (target-delivery target)
+        _   (ensure-running! u)
         fut (CompletableFuture.)
-        me  (spawn)]
+        me  (spawn u)]
     (reset! (.-beh me)
             (fn [v]
               (.complete fut v)
               (become! me (fn [& _] nil))))
-    (stage-or-enqueue! (->Delivery target actor me (vec msg) serializer 0))
+    (stage-or-enqueue! (->Delivery u target actor me (vec msg) serializer 0))
     fut))
 
 (defmacro on-commit!
@@ -152,68 +228,81 @@
       (catch Throwable t
         (report-effect-failure! t)))))
 
+(defn- validate-staged-sends! [sends]
+  (doseq [^Delivery d sends]
+    (ensure-running! (:universe d))))
+
 (defn- commit! [^Txn tx]
-  (let [becomes (vec (compact-becomes @(:becomes tx)))
+  (let [sends   @(:sends tx)
+        becomes (vec (compact-becomes @(:becomes tx)))
         actors  (mapv :actor becomes)]
+    (validate-staged-sends! sends)
     (lock-actors! actors
       (fn []
         (doseq [{:keys [^Actor actor old]} becomes]
           (when-not (identical? old @(.-beh actor))
             (throw (ex-info "Commit conflict" {:actor actor}))))
         (doseq [{:keys [^Actor actor new]} becomes]
-          (reset! (.-beh actor) new)))))
-  (doseq [^Delivery d @(:sends tx)]
-    (enqueue! d))
-  (run-commit-effects! @(:effects tx)))
+          (reset! (.-beh actor) new))))
+    (doseq [^Delivery d sends]
+      (enqueue-committed! (:universe d) d))
+    (run-commit-effects! @(:effects tx))))
 
-(defn- backoff-ms [n]
-  (min 500 (long (* 5 (Math/pow 2.0 (max 0 (dec (double n))))))))
+(defn- backoff-ms [^Universe u n]
+  (let [{:keys [retry-base-ms retry-max-ms]} (:opts u)]
+    (min retry-max-ms
+         (long (* retry-base-ms
+                  (Math/pow 2.0 (max 0 (dec (double n)))))))))
 
 (defn- retry-delivery [^Delivery d]
   (let [n  (inc (long (:retries d)))
-        ms (backoff-ms n)]
+        ms (backoff-ms (:universe d) n)]
     (when (pos? ms)
       (try (.sleep TimeUnit/MILLISECONDS ms) (catch InterruptedException _)))
     (assoc d :retries n)))
 
 (defn- run-turn! [^Delivery d]
   (let [^Actor act (:to d)
+        u   (:universe act)
         beh @(.-beh act)
-        tx  (new-tx)
+        tx  (new-tx u)
         reply-fn (fn [v] (when *sender* (send! *sender* v)))
         runnable (fn []
-                   (binding [*self*  act
+                   (binding [*universe* u
+                             *self*     act
                              *self-target* (:target d)
-                             *sender* (:from d)
-                             *reply*  reply-fn
-                             *tx*     tx]
+                             *sender*   (:from d)
+                             *reply*    reply-fn
+                             *tx*       tx]
                      (apply beh (:payload d))))]
     (runnable)
     (commit! tx)))
 
 (defn- run-with-retries! [^Delivery d]
   (loop [d d]
-    (when-let [retry (try
-                       (run-turn! d)
-                       nil
-                       (catch Throwable _
-                         (retry-delivery d)))]
-      (recur retry))))
+    (when @(:running? (:universe d))
+      (when-let [retry (try
+                         (run-turn! d)
+                         nil
+                         (catch Throwable _
+                           (retry-delivery d)))]
+        (recur retry)))))
 
 (declare drain-serializer!)
 
-(defn- schedule-serializer! [^Serializer s]
-  (when-let [^ExecutorService executor @pool]
-    (.submit executor ^Runnable #(drain-serializer! s))))
+(defn- schedule-serializer! [^Universe u ^Serializer s]
+  (when-let [^ExecutorService executor @(:pool u)]
+    (.submit executor ^Runnable #(drain-serializer! u s))))
 
-(defn- enqueue-serialized! [^Serializer s ^Delivery d]
+(defn- enqueue-serialized! [^Universe u ^Serializer s ^Delivery d]
+  (ensure-running! u)
   (let [start? (locking s
                  (.addLast ^ArrayDeque (:queue s) d)
                  (when-not @(:running? s)
                    (reset! (:running? s) true)
                    true))]
     (when start?
-      (schedule-serializer! s))))
+      (schedule-serializer! u s))))
 
 (defn- next-serialized-delivery [^Serializer s]
   (locking s
@@ -223,48 +312,52 @@
         (reset! (:running? s) false)
         nil))))
 
-(defn- drain-serializer! [^Serializer s]
+(defn- drain-serializer! [^Universe u ^Serializer s]
   (loop []
-    (when-let [d (next-serialized-delivery s)]
-      (run-with-retries! d)
-      (recur))))
+    (when @(:running? u)
+      (when-let [d (next-serialized-delivery s)]
+        (run-with-retries! d)
+        (recur)))))
 
 (defn- run-delivery! [^Delivery d]
   (if-let [s (:serializer d)]
-    (enqueue-serialized! s d)
+    (enqueue-serialized! (:universe d) s d)
     (when-let [retry (try
                        (run-turn! d)
                        nil
                        (catch Throwable _
                          (retry-delivery d)))]
-      (enqueue! retry))))
+      (enqueue! (:universe retry) retry))))
 
-(defn- pump-loop []
+(defn- pump-loop [^Universe u]
   (future
-    (while @running?
-      (when-let [^Delivery d (.poll queue 100 TimeUnit/MILLISECONDS)]
-        (if-let [s (:serializer d)]
-          (enqueue-serialized! s d)
-          (when-let [^ExecutorService executor @pool]
-            (.submit executor ^Runnable #(run-delivery! d))))))))
+    (let [queue (:queue u)
+          poll-ms (:pump-poll-ms (:opts u))]
+      (while @(:running? u)
+        (when-let [^Delivery d (.poll queue poll-ms TimeUnit/MILLISECONDS)]
+          (if-let [s (:serializer d)]
+            (enqueue-serialized! (:universe d) s d)
+            (when-let [^ExecutorService executor @(:pool u)]
+              (.submit executor ^Runnable #(run-delivery! d)))))))))
 
 (defn start!
-  "Start the dispatcher (idempotent)."
-  []
-  (when (compare-and-set! running? false true)
-    (reset! pool (Executors/newFixedThreadPool
-                   (max 2 (.availableProcessors (Runtime/getRuntime)))))
-    (reset! pump (pump-loop))
-    :started))
+  "Start a universe. Idempotent; returns the universe."
+  [^Universe u]
+  (let [u (ensure-universe u)]
+    (when (compare-and-set! (:running? u) false true)
+      (reset! (:pool u) (Executors/newFixedThreadPool (:threads (:opts u))))
+      (reset! (:pump u) (pump-loop u)))
+    u))
 
-(defn shutdown!
-  "Stop the dispatcher and shut down the worker pool."
-  []
-  (when (compare-and-set! running? true false)
-    (when-let [p @pump] (future-cancel p))
-    (when-let [^ExecutorService executor @pool]
-      (.shutdownNow executor))
-    (.clear queue)
-    (reset! pump nil)
-    (reset! pool nil)
-    :stopped))
+(defn stop!
+  "Stop a universe and shut down its worker pool. Idempotent; returns the universe."
+  [^Universe u]
+  (let [u (ensure-universe u)]
+    (when (compare-and-set! (:running? u) true false)
+      (when-let [p @(:pump u)] (future-cancel p))
+      (when-let [^ExecutorService executor @(:pool u)]
+        (.shutdownNow executor))
+      (.clear (:queue u))
+      (reset! (:pump u) nil)
+      (reset! (:pool u) nil))
+    u))

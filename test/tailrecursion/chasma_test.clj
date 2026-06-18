@@ -3,6 +3,8 @@
             [tailrecursion.chasma :as ch])
   (:import (java.util.concurrent CountDownLatch TimeUnit)))
 
+(def test-universe (atom nil))
+
 (defn counter
   "Stateful counter behavior using become! to hold the current value."
   [n]
@@ -70,7 +72,8 @@
         latch    (CountDownLatch. n)
         in-flight (atom 0)
         max-inf  (atom 0)
-        actor    (ch/spawn (lane-probe-behavior latch in-flight max-inf))
+        actor    (ch/spawn @test-universe
+                            (lane-probe-behavior latch in-flight max-inf))
         target   (if serialized? (ch/lane actor) actor)]
     (dotimes [_ n]
       (ch/send! target :tick))
@@ -93,7 +96,7 @@
 
 (deftest on-commit-returns-nil
   (let [observed (atom :unset)
-        actor    (ch/spawn
+        actor    (ch/spawn @test-universe
                    (fn [& _]
                      (let [ret (ch/on-commit! (reset! observed :committed))]
                        (ch/*reply* ret))))]
@@ -106,30 +109,33 @@
     (ch/*reply* label)))
 
 (deftest spawn-without-args-produces-noop
-  (let [actor (ch/spawn)]
+  (let [actor (ch/spawn @test-universe)]
     (ch/become! actor (fn [cmd]
                         (when (= cmd :hello)
                           (ch/*reply* :hi))))
     (is (= :hi (deref (ch/ask actor :hello) 1000 ::timeout)))))
 
+(deftest spawn-without-universe-requires-turn
+  (is (thrown? IllegalStateException (ch/spawn (constantly nil)))))
+
 (deftest become!-requires-complete-pairs
-  (let [actor (ch/spawn)]
+  (let [actor (ch/spawn @test-universe)]
     (is (try
           (ch/become! actor (responder :ok) actor)
           false
           (catch IllegalArgumentException _ true)))))
 
 (deftest multi-become-outside-turn
-  (let [a (ch/spawn (responder :old-a))
-        b (ch/spawn (responder :old-b))]
+  (let [a (ch/spawn @test-universe (responder :old-a))
+        b (ch/spawn @test-universe (responder :old-b))]
     (ch/become! a (responder :new-a) b (responder :new-b))
     (is (= :new-a (deref (ch/ask a) 1000 ::timeout)))
     (is (= :new-b (deref (ch/ask b) 1000 ::timeout)))))
 
 (deftest multi-become-inside-turn
-  (let [a   (ch/spawn (responder :old-a))
-        b   (ch/spawn (responder :old-b))
-        ctl (ch/spawn
+  (let [a   (ch/spawn @test-universe (responder :old-a))
+        b   (ch/spawn @test-universe (responder :old-b))
+        ctl (ch/spawn @test-universe
               (fn [& _]
                 (ch/become! a (responder :new-a) b (responder :new-b))
                 (ch/*reply* :done)))]
@@ -138,8 +144,8 @@
     (is (= :new-b (deref (ch/ask b) 1000 ::timeout)))))
 
 (deftest multi-become-compacts-repeated-actors
-  (let [a   (ch/spawn (responder :old))
-        ctl (ch/spawn
+  (let [a   (ch/spawn @test-universe (responder :old))
+        ctl (ch/spawn @test-universe
               (fn [& _]
                 (ch/become! a (responder :middle))
                 (ch/become! a (responder :final))
@@ -148,9 +154,9 @@
     (is (= :final (deref (ch/ask a) 1000 ::timeout)))))
 
 (deftest multi-become-commit-is-all-or-nothing
-  (let [a      (ch/spawn (responder :old-a))
-        b      (ch/spawn (responder :old-b))
-        tx     (#'ch/new-tx)
+  (let [a      (ch/spawn @test-universe (responder :old-a))
+        b      (ch/spawn @test-universe (responder :old-b))
+        tx     (#'ch/new-tx @test-universe)
         old-a  @(.-beh a)
         old-b  @(.-beh b)]
     (swap! (:becomes tx) conj {:actor a :old old-a :new (responder :new-a)})
@@ -162,21 +168,22 @@
 
 (use-fixtures :once
   (fn [f]
-    (ch/start!)
+    (reset! test-universe (ch/start! (ch/universe)))
     (try
       (f)
       (finally
-        (ch/shutdown!)))))
+        (ch/stop! @test-universe)))))
 
 (deftest counter-behavior-test
-  (let [counter (ch/lane (ch/spawn (counter 0)))]
+  (let [counter (ch/lane (ch/spawn @test-universe (counter 0)))]
     (ch/send! counter :inc)
     (ch/send! counter :inc)
     (is (= 2 (deref (ch/ask counter :get) 1000 ::timeout)))))
 
 (deftest ask-retries-after-failure
   (let [attempts (atom 0)
-        actor    (ch/spawn (flaky-behavior 42 attempts (atom true)))
+        actor    (ch/spawn @test-universe
+                            (flaky-behavior 42 attempts (atom true)))
         fut      (ch/ask actor :value)
         result   (deref fut 1000 ::timeout)]
     (is (not= ::timeout result))
@@ -192,7 +199,8 @@
 (deftest map-first-arg-is-payload
   (let [observed (atom nil)
         latch    (CountDownLatch. 1)
-        actor    (ch/spawn (fn [& payload]
+        actor    (ch/spawn @test-universe
+                   (fn [& payload]
                               (reset! observed (vec payload))
                               (.countDown latch)))]
     (ch/send! actor {:ser :not-options} :value)
@@ -202,11 +210,13 @@
 (deftest send-effects-commit-only-after-success
   (let [hits     (atom [])
         latch    (CountDownLatch. 1)
-        target   (ch/spawn (fn [& payload]
+        target   (ch/spawn @test-universe
+                   (fn [& payload]
                               (swap! hits conj (vec payload))
                               (.countDown latch)))
         attempts (atom 0)
-        actor    (ch/spawn (deferred-sender target attempts (atom true)))]
+        actor    (ch/spawn @test-universe
+                            (deferred-sender target attempts (atom true)))]
     (ch/send! actor :go)
     (is (.await latch 1000 TimeUnit/MILLISECONDS))
     (is (= [[:attempt 2]] @hits))
@@ -216,7 +226,8 @@
   (let [counter  (atom 0)
         attempts (atom 0)
         latch    (CountDownLatch. 1)
-        actor    (ch/spawn (on-commit-probe counter attempts latch (atom true)))]
+        actor    (ch/spawn @test-universe
+                            (on-commit-probe counter attempts latch (atom true)))]
     (ch/send! actor :run)
     (is (.await latch 1000 TimeUnit/MILLISECONDS))
     (is (= 1 @counter))
@@ -225,7 +236,8 @@
 (deftest become-rolls-back-on-failure
   (let [fail-once? (atom true)
         attempts   (atom 0)
-        actor      (ch/spawn (restartable-counter 0 fail-once? attempts))]
+        actor      (ch/spawn @test-universe
+                              (restartable-counter 0 fail-once? attempts))]
     (is (= 0 (deref (ch/ask actor :tick) 1000 ::timeout)))
     (is (= 1 (deref (ch/ask actor :tick) 1000 ::timeout)))
     (is (= 3 @attempts))))
@@ -234,7 +246,7 @@
   (let [start   (CountDownLatch. 2)
         release (CountDownLatch. 1)
         done    (CountDownLatch. 2)
-        actor   (ch/spawn (lane-blocker start release done))
+        actor   (ch/spawn @test-universe (lane-blocker start release done))
         lane-a  (ch/lane actor)
         lane-b  (ch/lane actor)]
     (ch/send! lane-a :ping)
@@ -249,14 +261,16 @@
 (deftest sender-preserves-lane-capability
   (let [observed (atom nil)
         latch    (CountDownLatch. 1)
-        a        (ch/spawn (fn [_ target]
+        a        (ch/spawn @test-universe
+                   (fn [_ target]
                              (ch/send! target :from-a)
                              (ch/become! ch/*self*
                                (fn [v]
                                  (reset! observed v)
                                  (.countDown latch)))))
         a-lane   (ch/lane a)
-        b        (ch/spawn (fn [& _]
+        b        (ch/spawn @test-universe
+                   (fn [& _]
                              (ch/send! ch/*sender*
                                        (instance? tailrecursion.chasma.Lane ch/*sender*))))]
     (ch/send! a-lane :go b)
@@ -266,13 +280,15 @@
 (deftest ask-effects-commit-only-after-success
   (let [hits      (atom [])
         latch     (CountDownLatch. 1)
-        target    (ch/spawn (fn [& payload]
+        target    (ch/spawn @test-universe
+                    (fn [& payload]
                               (swap! hits conj (vec payload))
                               (.countDown latch)
                               (ch/*reply* :ok)))
         attempts  (atom 0)
         fail-once (atom true)
-        actor     (ch/spawn (fn [& _]
+        actor     (ch/spawn @test-universe
+                    (fn [& _]
                               (let [n (swap! attempts inc)]
                                 (ch/ask target :attempt n)
                                 (when (compare-and-set! fail-once true false)
@@ -286,10 +302,12 @@
   (let [observed (atom nil)
         latch    (CountDownLatch. 1)
         actor-ref (atom nil)
-        actor    (ch/spawn
+        actor    (ch/spawn @test-universe
                    (fn [& _]
                      (ch/on-commit!
                        (reset! observed {:self?  (identical? ch/*self* @actor-ref)
+                                         :universe? (identical? ch/*universe*
+                                                                @test-universe)
                                          :sender ch/*sender*
                                          :tx     ch/*tx*})
                        (.countDown latch))
@@ -298,6 +316,7 @@
     (is (= :done (deref (ch/ask actor) 1000 ::timeout)))
     (is (.await latch 1000 TimeUnit/MILLISECONDS))
     (is (:self? @observed))
+    (is (:universe? @observed))
     (is (some? (:sender @observed)))
     (is (nil? (:tx @observed)))))
 
@@ -305,10 +324,12 @@
   (let [attempts (atom 0)
         hits     (atom [])
         latch    (CountDownLatch. 1)
-        target   (ch/spawn (fn [& payload]
+        target   (ch/spawn @test-universe
+                   (fn [& payload]
                              (swap! hits conj (vec payload))
                              (.countDown latch)))
-        actor    (ch/spawn (fn [& _]
+        actor    (ch/spawn @test-universe
+                   (fn [& _]
                              (swap! attempts inc)
                              (ch/send! target :committed)
                              (ch/on-commit!
@@ -320,24 +341,117 @@
     (is (= [[:committed]] @hits))))
 
 (deftest runtime-can-restart
-  (ch/shutdown!)
-  (try
-    (is (= :started (ch/start!)))
-    (let [counter (ch/lane (ch/spawn (counter 0)))]
-      (ch/send! counter :inc)
-      (is (= 1 (deref (ch/ask counter :get) 1000 ::timeout))))
-    (is (= :stopped (ch/shutdown!)))
-    (is (= :started (ch/start!)))
-    (let [counter (ch/lane (ch/spawn (counter 0)))]
-      (ch/send! counter :inc)
-      (ch/send! counter :inc)
-      (is (= 2 (deref (ch/ask counter :get) 1000 ::timeout))))
-    (finally
-      (ch/start!))))
+  (let [u (ch/universe {:retry-base-ms 0 :retry-max-ms 0})]
+    (try
+      (is (identical? u (ch/start! u)))
+      (let [counter (ch/lane (ch/spawn u (counter 0)))]
+        (ch/send! counter :inc)
+        (is (= 1 (deref (ch/ask counter :get) 1000 ::timeout))))
+      (is (identical? u (ch/stop! u)))
+      (is (identical? u (ch/start! u)))
+      (let [counter (ch/lane (ch/spawn u (counter 0)))]
+        (ch/send! counter :inc)
+        (ch/send! counter :inc)
+        (is (= 2 (deref (ch/ask counter :get) 1000 ::timeout))))
+      (finally
+        (ch/stop! u)))))
+
+(deftest universe-validates-options
+  (is (thrown? IllegalArgumentException (ch/universe {:threads 0})))
+  (is (thrown? IllegalArgumentException (ch/universe {:pump-poll-ms -1})))
+  (is (thrown? IllegalArgumentException (ch/universe {:retry-base-ms -1})))
+  (is (thrown? IllegalArgumentException
+               (ch/universe {:retry-base-ms 10 :retry-max-ms 5}))))
+
+(deftest single-thread-universe-serializes-direct-deliveries
+  (let [u        (ch/start! (ch/universe {:threads 1}))
+        n        8
+        latch    (CountDownLatch. n)
+        in-flight (atom 0)
+        max-inf  (atom 0)
+        actor    (ch/spawn u (lane-probe-behavior latch in-flight max-inf))]
+    (try
+      (dotimes [_ n]
+        (ch/send! actor :tick))
+      (is (.await latch 2000 TimeUnit/MILLISECONDS))
+      (is (= 1 @max-inf))
+      (finally
+        (ch/stop! u)))))
+
+(deftest stopped-universe-rejects-delivery
+  (let [u     (ch/universe)
+        actor (ch/spawn u (responder :ok))]
+    (is (thrown? IllegalStateException (ch/send! actor :go)))
+    (is (thrown? IllegalStateException (ch/ask actor :go)))
+    (ch/start! u)
+    (ch/stop! u)
+    (is (thrown? IllegalStateException (ch/send! actor :go)))
+    (is (thrown? IllegalStateException (ch/ask actor :go)))))
+
+(deftest universes-run-independently
+  (let [u1     (ch/start! (ch/universe))
+        u2     (ch/start! (ch/universe))
+        latch1 (CountDownLatch. 1)
+        latch2 (CountDownLatch. 1)
+        a1     (ch/spawn u1 (fn [& _] (.countDown latch1)))
+        a2     (ch/spawn u2 (fn [& _] (.countDown latch2)))]
+    (try
+      (ch/send! a1 :one)
+      (ch/send! a2 :two)
+      (is (.await latch1 1000 TimeUnit/MILLISECONDS))
+      (is (.await latch2 1000 TimeUnit/MILLISECONDS))
+      (ch/stop! u1)
+      (let [latch3 (CountDownLatch. 1)
+            a3     (ch/spawn u2 (fn [& _] (.countDown latch3)))]
+        (is (thrown? IllegalStateException (ch/send! a1 :stopped)))
+        (ch/send! a3 :still-running)
+        (is (.await latch3 1000 TimeUnit/MILLISECONDS)))
+      (finally
+        (ch/stop! u1)
+        (ch/stop! u2)))))
+
+(deftest targets-and-ask-carry-universe
+  (let [observed (atom nil)
+        actor    (ch/spawn @test-universe
+                   (fn [& _]
+                     (reset! observed {:self-universe ch/*universe*
+                                       :sender-universe (:universe ch/*sender*)})
+                     (ch/*reply* :ok)))
+        lane     (ch/lane actor)]
+    (is (identical? @test-universe (:universe actor)))
+    (is (identical? @test-universe (:universe lane)))
+    (is (= :ok (deref (ch/ask lane :go) 1000 ::timeout)))
+    (is (identical? @test-universe (:self-universe @observed)))
+    (is (identical? @test-universe (:sender-universe @observed)))))
+
+(deftest spawn-without-universe-works-inside-turn
+  (let [observed (atom nil)
+        actor    (ch/spawn @test-universe
+                   (fn [& _]
+                     (let [child (ch/spawn (fn [& _] nil))]
+                       (reset! observed (identical? ch/*universe*
+                                                    (:universe child)))
+                       (ch/*reply* :done))))]
+    (is (= :done (deref (ch/ask actor :go) 1000 ::timeout)))
+    (is (= true @observed))))
+
+(deftest cross-universe-become-is-rejected
+  (let [u1 (ch/start! (ch/universe))
+        u2 (ch/start! (ch/universe))
+        a  (ch/spawn u1 (responder :old-a))
+        b  (ch/spawn u2 (responder :old-b))]
+    (try
+      (is (thrown? IllegalArgumentException
+                   (ch/become! a (responder :new-a) b (responder :new-b))))
+      (is (= :old-a (deref (ch/ask a) 1000 ::timeout)))
+      (is (= :old-b (deref (ch/ask b) 1000 ::timeout)))
+      (finally
+        (ch/stop! u1)
+        (ch/stop! u2)))))
 
 (deftest odd-even-mutual-recursion
-  (let [even (ch/spawn)
-        odd  (ch/spawn)
+  (let [even (ch/spawn @test-universe)
+        odd  (ch/spawn @test-universe)
         await (fn [actor n]
                 (deref (ch/ask actor n) 1000 ::timeout))
         even-beh (fn even-beh
