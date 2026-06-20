@@ -3,8 +3,6 @@
             tailrecursion.chasma-clos-test
             tailrecursion.chasma-test))
 
-(set! *warn-on-reflection* true)
-
 (defn -main
   [& _]
   (let [{:keys [fail error]} (t/run-tests 'tailrecursion.chasma-test

@@ -3,8 +3,6 @@
             [tailrecursion.chasma :as ch])
   (:import (java.util.concurrent CountDownLatch TimeUnit)))
 
-(set! *warn-on-reflection* true)
-
 (def test-universe (atom nil))
 
 (defn counter

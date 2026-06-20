@@ -103,6 +103,15 @@ The project is built with `deps.edn`. Run the test suite with:
 clojure -M:test
 ```
 
+Run the WebSocket chat demo with:
+
+```bash
+clojure -M:chat
+```
+
+Then open `http://localhost:8080/`. The demo uses Undertow through the
+`:chat` alias only; Undertow is not a core library dependency.
+
 ## License
 
 MIT

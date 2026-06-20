@@ -8,8 +8,6 @@
                                  LinkedBlockingQueue
                                  TimeUnit)))
 
-(set! *warn-on-reflection* true)
-
 (def ^:private default-options
   {:threads (max 2 (.availableProcessors (Runtime/getRuntime))),
    :pump-poll-ms 100,

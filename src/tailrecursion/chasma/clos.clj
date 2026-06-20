@@ -3,8 +3,6 @@
   (:refer-clojure :exclude [defmethod])
   (:import (clojure.lang PersistentStructMap PersistentStructMap$Def)))
 
-(set! *warn-on-reflection* true)
-
 (def ^:dynamic *next-methods* nil)
 (def ^:dynamic *next-method-args* nil)
 

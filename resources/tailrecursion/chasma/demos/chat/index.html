@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Chasma Chat</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; background: Canvas; color: CanvasText; }
+      main { max-width: 720px; margin: 0 auto; padding: 24px; }
+      header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+      h1 { font-size: 20px; margin: 0 0 16px; }
+      #status { color: color-mix(in srgb, CanvasText 65%, transparent); font-size: 14px; }
+      #messages { border: 1px solid color-mix(in srgb, CanvasText 18%, transparent); border-radius: 8px; min-height: 360px; padding: 12px; overflow: auto; }
+      .message { margin: 0 0 8px; }
+      .meta { color: color-mix(in srgb, CanvasText 62%, transparent); font-size: 13px; }
+      form { display: flex; gap: 8px; margin-top: 12px; }
+      input { flex: 1; min-width: 0; padding: 10px 12px; border: 1px solid color-mix(in srgb, CanvasText 18%, transparent); border-radius: 6px; font: inherit; }
+      button { padding: 10px 14px; border: 0; border-radius: 6px; background: #2563eb; color: white; font: inherit; cursor: pointer; }
+      button:disabled { opacity: .55; cursor: default; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Chasma Chat</h1>
+        <div id="status">connecting</div>
+      </header>
+      <div id="messages" aria-live="polite"></div>
+      <form id="name-form">
+        <input id="name" autocomplete="name" placeholder="Name">
+        <button>Join</button>
+      </form>
+      <form id="message-form">
+        <input id="message" autocomplete="off" placeholder="Message" disabled>
+        <button disabled>Send</button>
+      </form>
+    </main>
+    <script>
+      const status = document.querySelector("#status");
+      const messages = document.querySelector("#messages");
+      const nameForm = document.querySelector("#name-form");
+      const messageForm = document.querySelector("#message-form");
+      const nameInput = document.querySelector("#name");
+      const messageInput = document.querySelector("#message");
+      const messageButton = messageForm.querySelector("button");
+      const scheme = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${scheme}://${location.host}/ws`);
+
+      function append(text, meta = "") {
+        const item = document.createElement("div");
+        item.className = "message";
+        const body = document.createElement("div");
+        body.textContent = text;
+        item.append(body);
+        if (meta) {
+          const label = document.createElement("div");
+          label.className = "meta";
+          label.textContent = meta;
+          item.append(label);
+        }
+        messages.append(item);
+        messages.scrollTop = messages.scrollHeight;
+      }
+
+      function send(message) {
+        ws.send(JSON.stringify(message));
+      }
+
+      ws.addEventListener("open", () => {
+        status.textContent = "connected";
+        messageInput.disabled = false;
+        messageButton.disabled = false;
+      });
+
+      ws.addEventListener("close", () => {
+        status.textContent = "disconnected";
+        messageInput.disabled = true;
+        messageButton.disabled = true;
+      });
+
+      ws.addEventListener("message", event => {
+        const message = JSON.parse(event.data);
+        const type = message.type;
+        if (type === "message") append(message.text, message.from);
+        if (type === "joined") append(`${message.name} joined`);
+        if (type === "left") append(`${message.name} left`);
+        if (type === "renamed") append(`${message.from} is now ${message.to}`);
+        if (type === "error") append(message.reason, "error");
+      });
+
+      nameForm.addEventListener("submit", event => {
+        event.preventDefault();
+        send({type: "join", name: nameInput.value});
+      });
+
+      messageForm.addEventListener("submit", event => {
+        event.preventDefault();
+        const text = messageInput.value.trim();
+        if (!text) return;
+        send({type: "say", text});
+        messageInput.value = "";
+      });
+    </script>
+  </body>
+</html>
