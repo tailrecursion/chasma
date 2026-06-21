@@ -13,6 +13,20 @@
   (is (= :object (dispatch :x)))
   (is (= :value (dispatch :k))))
 
+(deftest method-introspection
+  (is (= [:primary :primary :primary]
+         (mapv :qualifier (clos/methods dispatch))))
+  (is (= [0 1 2] (mapv :index (clos/methods dispatch))))
+  (is (every? #(not (contains? % :fn)) (clos/methods dispatch))))
+
+(deftest applicable-method-introspection
+  (is (= [[:value] [:class]]
+         (mapv (fn [method] (mapv :kind (:specializers method)))
+           (clos/applicable-methods dispatch :k))))
+  (is (= [[:class] [:class]]
+         (mapv (fn [method] (mapv :kind (:specializers method)))
+           (clos/applicable-methods dispatch "a")))))
+
 (clos/defgeneric next-method)
 
 (clos/defmethod next-method [(x Number)] (str "num-" x))

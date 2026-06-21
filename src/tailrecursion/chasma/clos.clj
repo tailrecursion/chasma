@@ -1,6 +1,6 @@
 (ns tailrecursion.chasma.clos
   "CLOS-style generic functions and method combinations."
-  (:refer-clojure :exclude [defmethod])
+  (:refer-clojure :exclude [defmethod methods])
   (:import (clojure.lang PersistentStructMap PersistentStructMap$Def)))
 
 (def ^:dynamic *next-methods* nil)
@@ -230,7 +230,7 @@
     (when (and arity (not= arity actual))
       (throw (ex-info "Arity mismatch" {:expected arity, :actual actual})))))
 
-(defn- applicable-methods
+(defn- applicable-method-seq
   [methods args pred-exceptions]
   (let [applies? (fn [spec arg] (applicable? spec arg pred-exceptions))]
     (filter #(every? true? (map applies? (:specializers %) args)) methods)))
@@ -238,12 +238,12 @@
 (defn- primary-methods
   [methods args pred-exceptions]
   (sort-methods (filter #(= :primary (:qualifier %))
-                  (applicable-methods methods args pred-exceptions))
+                  (applicable-method-seq methods args pred-exceptions))
                 args))
 
 (defn- combine-standard
   [methods args pred-exceptions]
-  (let [applicable (applicable-methods methods args pred-exceptions)
+  (let [applicable (applicable-method-seq methods args pred-exceptions)
         grouped (group-by :qualifier applicable)
         arounds (sort-methods (get grouped :around []) args)
         befores (sort-methods (get grouped :before []) args)
@@ -317,9 +317,27 @@
   [v]
   (let [var (cond (var? v) v
                   (symbol? v) (resolve v))]
-    (ensure-generic var v)
-    (-> (meta var)
+    (ensure-generic (or var v) v)
+    (-> (meta (or var v))
         :generic)))
+
+(defn- method-info [method] (dissoc method :fn))
+
+(defn methods
+  "Returns the methods defined on a generic function, in definition order."
+  [v]
+  (->> @(generic v)
+       :methods
+       (mapv method-info)))
+
+(defn applicable-methods
+  "Returns the methods applicable to args, in dispatch precedence order."
+  [v & args]
+  (let [{:keys [methods arity pred-exceptions]} @(generic v)]
+    (ensure-arity arity args)
+    (mapv method-info
+      (sort-methods (applicable-method-seq methods args pred-exceptions)
+                    args))))
 
 (defn add-method!
   [v qualifier specializers f]

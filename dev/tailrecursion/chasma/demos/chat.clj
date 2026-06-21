@@ -38,8 +38,7 @@
 (clos/defmethod decode [(m {"type" "join"})] m)
 (clos/defmethod decode [(m {"type" "say"})] m)
 (clos/defmethod decode [(m {"type" "rename"})] m)
-(clos/defmethod decode [(m clojure.lang.IPersistentMap)]
-  {"type" "error", "reason" "unknown-message"})
+(clos/defmethod decode [m] {"type" "error", "reason" "unknown-message"})
 
 (clos/defmethod handle [(state room-state) (event opened)]
   (let [conn (:conn event)
