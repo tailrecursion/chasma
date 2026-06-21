@@ -10,6 +10,7 @@
                       "dev/tailrecursion/chasma/demos/chat.clj"
                       "src/tailrecursion/chasma.clj"
                       "src/tailrecursion/chasma/clos.clj"
+                      "test/tailrecursion/chasma_demos_chat_test.clj"
                       "test/tailrecursion/chasma_test.clj"
                       "test/tailrecursion/chasma_clos_test.clj"
                       "test/tailrecursion/test_runner.clj"],
@@ -17,7 +18,9 @@
     :lint {:main-opts ["-m" "clj-kondo.main" "--lint" "src" "test" "dev"
                        ".clj-kondo" "deps.edn"],
            :replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.05.25"}}},
-    :test {:extra-paths ["test"],
+    :test {:extra-deps {io.undertow/undertow-core {:mvn/version "2.4.1.Final"},
+                        org.clojure/data.json {:mvn/version "2.5.1"}},
+           :extra-paths ["test" "dev" "resources"],
            :jvm-opts ["-Dclojure.compile.warn-on-reflection=true"],
            :main-opts ["-m" "tailrecursion.test-runner"]}},
  :deps {org.clojure/clojure {:mvn/version "1.12.3"}},
